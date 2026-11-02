@@ -1,0 +1,20 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# SoundFonts (muy pesados)
+*.sf2
+
+# IDEs
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Claves y datos privados
+.env
+avastcodigo.txt

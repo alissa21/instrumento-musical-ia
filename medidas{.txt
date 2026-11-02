@@ -1,0 +1,19 @@
+Switch: Posee 2 pines, y un poste central.
+
+Para diseñar la base y los agujeros para que entre los pines utiliza estas medidas: 
+ 
+Si vas a trazar las distancias relativas tomando como origen (0,0) el centro exacto del Poste Central (Pivote), las coordenadas de los pines inferiores son las siguientes:
+• Poste Central (Pivote Plástico):
+	• Diámetro exacto: 3.40 mm (+- 0.05).
+	• Función: Centrado principal del switch en la placa.
+• Pin Eléctrico 1 (Izquierdo / Terminal de contacto):
+	• Coordenada X: -5.08 mm (hacia la izquierda del centro).
+	• Coordenada Y: -3.81 mm (hacia abajo del centro).
+	• Diámetro sugerido del orificio (Pad): 1.50 mm (para que quepa el socket Hot-swap o la soldadura con holgura).
+• Pin Eléctrico 2 (Derecho / Terminal de diodo/contacto):
+	• Coordenada X: +2.54 mm (hacia la derecha del centro).
+	• Coordenada Y: -5.08 mm (hacia abajo del centro).
+	• Distancia directa horizontal entre Pin 1 y Pin 2: 7.62 mm.
+	• Diámetro sugerido del orificio (Pad): 1.50 mm.
+
+altura 

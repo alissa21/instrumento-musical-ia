@@ -1,0 +1,14 @@
+net view
+
+ipconfig
+ipconfig /all
+ipconfig /renew
+
+arp -a
+
+pathping (ip)
+
+tracert
+tracert (ip)
+
+netstat
