@@ -1,42 +1,258 @@
+import json
+import os
 import threading
-import grabar, convertir, correccion, gem, reproducir, esp32
+import time
 
+import grabar, convertir, correccion, gem, reproducir, esp32, proyectos, sugerencia
+
+CONFIG = "config.json"
+
+# Cada tipo de pista usa siempre el mismo canal MIDI (ver Multipista con FluidSynth)
+CANAL_MELODIA = 0
+CANAL_TECLADO = 1
+CANAL_IA = 2
+NOMBRE_PISTA = {CANAL_MELODIA: "la melodía", CANAL_TECLADO: "el teclado", CANAL_IA: "la sugerencia de la IA"}
+
+proyecto = None            # proyecto abierto (archivo MIDI multipista) o None en la pantalla de inicio
+nombre = None              # nombre del archivo del proyecto, sin .mid
+ultima_propuesta = ""      # última idea que propuso la IA, por si el usuario la acepta
+grabacion_teclado = None   # notas tocadas mientras se graba el teclado (None = no se está grabando)
+inicio_teclado = 0.0
+
+
+# =====================================================================
+#  Configuración (primer inicio)
+# =====================================================================
+
+def cargar_config():
+    if not os.path.exists(CONFIG):
+        return None  # no existe: es el primer inicio
+    with open(CONFIG, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def guardar_config(usuario, voz):
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        json.dump({"usuario": usuario, "voz": voz}, f, ensure_ascii=False)
+
+
+def primer_inicio():
+    """Bienvenida -> elegir la voz de la IA -> decir el nombre del usuario. Se hace una sola vez."""
+    esp32.enviar("PANTALLA:BIENVENIDA")
+    voz = esp32.esperar_voz()   # después de elegirla, el ESP32 muestra solo la pantalla del micrófono
+    gem.voz_actual = voz
+    gem.leer("[warmly] Hola, voy a ser tu asistente musical. ¿Cómo te llamas? "
+             "Presiona el botón de chat, dime tu nombre y vuelve a presionarlo.", expresar=False)
+    usuario = proyectos.pedir_nombre("usuario")   # micrófono y "¿Es correcto?"
+    guardar_config(usuario, voz)
+    return {"usuario": usuario, "voz": voz}
+
+
+# =====================================================================
+#  Programa principal
+# =====================================================================
 
 def main():
-    gem.leer("Hola. Bienvenido a la estacion musical con Inteligencia Artificial, estoy aqui para ayudarte a componer y a acompañar tus ideas musicales. Cuando quieras, puedes presionar el boton de chat para hablar conmigo, o el boton de melodia para grabar una melodia que deseas convertir en algun instrumento.")
+    if not esp32.conectar():
+        print("No se encontró el ESP32 (revisa PUERTO en esp32.py). El instrumento no funciona sin él.")
+        return
 
-    hay_esp32 = esp32.conectar()
-    if hay_esp32:
-        print("Elige en la pantalla del ESP32 el instrumento del teclado y presiona el joystick para confirmar...")
-        reproducir.elegir_instrumento(esp32.esperar_instrumento_teclado())
-        # El teclado suena en segundo plano mientras se graba, se conversa o se reproduce una melodía.
-        threading.Thread(target=tocar_teclado, daemon=True).start()
+    # El teclado suena en segundo plano mientras se graba, se conversa o se reproduce el proyecto.
+    reproducir.elegir_instrumento(esp32.instrumento_teclado)
+    threading.Thread(target=tocar_teclado, daemon=True).start()
+
+    # Python le indica al ESP32 qué pantalla mostrar, porque los datos guardados están en la computadora.
+    config = cargar_config()
+    if config is None:
+        config = primer_inicio()
     else:
-        print("No se encontró el ESP32 (revisa el puerto en esp32.py). Sigue sin el teclado.")
+        gem.voz_actual = config["voz"]
+    esp32.enviar(f"PANTALLA:INICIO:{proyectos.sin_tildes(config['usuario'])}")
+    gem.leer(f"[warmly] Hola, {config['usuario']}. ¿Qué vamos a componer hoy?", expresar=False)
 
     try:
         while True:
-            tipo = grabar.grabar()  # "melodia" | "chat" | "" si quedó vacía | False si no hay ESP32
-            if tipo == "melodia":
-                procesar_melodia(hay_esp32)
-            elif tipo == "chat":
-                procesar_chat()
-            if tipo is False:
-                break
+            pedido = esp32.leer_pedido()
+            if pedido is not None:
+                atender(pedido, config)
     except KeyboardInterrupt:
         print("Saliendo...")
     finally:
+        if proyecto is not None:
+            proyectos.guardar(proyecto, nombre)
         reproducir.cerrar()
 
 
+def atender(pedido, config):
+    """Hace lo que se pidió desde el ESP32 (botones y opciones del menú)."""
+    global proyecto, nombre
+    tipo = pedido[0]
+
+    # ----- Pantalla de inicio -----
+    if tipo == "NUEVO":
+        nombre = proyectos.preguntar_nombre_proyecto()   # "¿Deseas ponerle un nombre al proyecto?"
+        proyecto = proyectos.nuevo()
+        proyectos.guardar(proyecto, nombre)
+        abrir_pantalla_principal()
+
+    elif tipo == "ABRIR":
+        nombres = proyectos.listar()
+        if pedido[1] < len(nombres):
+            nombre = nombres[pedido[1]]
+            proyecto = proyectos.abrir(nombre)
+            abrir_pantalla_principal()
+            reproducir.reproducir_proyecto(proyecto)
+
+    elif tipo == "RENOMBRAR":
+        nombres = proyectos.listar()
+        if pedido[1] < len(nombres):
+            nuevo = proyectos.limpiar_nombre(proyectos.pedir_nombre("proyecto"))
+            proyectos.renombrar(nombres[pedido[1]], nuevo)
+            esp32.enviar("LISTA:" + ",".join(proyectos.listar()))   # vuelve a Proyectos
+
+    elif tipo == "VOZ":   # Ajustes > Voz de la IA (esp32.py ya cambió gem.voz_actual)
+        config["voz"] = pedido[1]
+        guardar_config(config["usuario"], config["voz"])
+        gem.leer("[cheerfully] ¡Hola! Así suena mi nueva voz.", expresar=False)
+
+    # ----- Dentro de un proyecto -----
+    elif proyecto is None:
+        return   # el resto de los pedidos solo sirven con un proyecto abierto
+
+    elif tipo == "BOTON":
+        atender_boton(pedido)
+
+    elif tipo == "PLAY":
+        reproducir.reproducir_proyecto(proyecto)
+
+    elif tipo == "MOVER":   # MOVER:canal:tiempos
+        proyectos.mover_pista(proyecto, pedido[1], pedido[2])
+        proyectos.guardar(proyecto, nombre)
+
+    elif tipo == "PISTA":   # PISTA:canal:accion[:valor]
+        atender_pista(pedido[1], pedido[2], pedido[3])
+
+    elif tipo == "CERRAR":  # Ajustes > Volver al inicio
+        proyectos.guardar(proyecto, nombre)
+        proyecto = None
+
+
+def abrir_pantalla_principal():
+    enviar_pistas()
+    esp32.enviar(f"PANTALLA:PRINCIPAL:{nombre}")
+
+
+def enviar_pistas():
+    """Le manda al ESP32 los canales de las pistas del proyecto, por ejemplo PISTAS:0,1,2."""
+    esp32.enviar("PISTAS:" + ",".join(str(canal) for canal in proyectos.canales(proyecto)))
+
+
+def agregar_pista(pista):
+    """Pone la pista en el proyecto (reemplaza la que había en ese canal) y guarda."""
+    proyectos.poner_pista(proyecto, pista)
+    proyectos.guardar(proyecto, nombre)   # se guarda cada vez que se agrega una pista
+    enviar_pistas()
+
+
+# =====================================================================
+#  Botones de grabación
+# =====================================================================
+
+def atender_boton(pedido):
+    global grabacion_teclado, inicio_teclado
+    _, boton, encendido = pedido
+
+    if boton == "teclado":
+        # El teclado sigue sonando como siempre; mientras tanto se anotan las notas con su tiempo.
+        if encendido:
+            inicio_teclado = time.time()
+            grabacion_teclado = []
+        elif grabacion_teclado is not None:
+            guardar_pista_teclado()
+
+    elif encendido:
+        # grabar.py espera el toque que empieza la grabación: se le devuelve el que ya llegó.
+        esp32.devolver(pedido)
+        tipo = grabar.grabar()   # graba hasta que se vuelve a tocar el mismo botón
+        if tipo == "melodia":
+            procesar_melodia()
+        elif tipo == "chat":
+            procesar_chat()
+
+
+def procesar_melodia():
+    global ultima_propuesta
+    archivo_midi = convertir.conversion("grabacion_melodia.wav")   # Basic Pitch
+    tonalidad = correccion.detectar_tonalidad(archivo_midi)        # music21
+    correccion.corregir(archivo_midi, tonalidad)                   # afina las notas dentro de la escala
+
+    # La pista se crea con el instrumento elegido en ese momento para el micrófono.
+    pista = proyectos.midi_a_pista(archivo_midi, CANAL_MELODIA, esp32.instrumento_microfono,
+                                   proyecto.ticks_per_beat)
+    agregar_pista(pista)
+    reproducir.reproducir_proyecto(proyecto)
+
+    ultima_propuesta = gem.analizar_midi(correccion.midi_txt(archivo_midi), tonalidad)
+
+
+def procesar_chat():
+    global ultima_propuesta
+    resultado = gem.responder("grabacion_chat.wav")
+    if resultado is None:
+        return   # no se entendió nada
+    mensaje, respuesta = resultado
+
+    # Si el usuario está de acuerdo con la idea que propuso la IA, se arma y se reproduce.
+    if ultima_propuesta and gem.acepto_sugerencia(ultima_propuesta, mensaje):
+        generar_sugerencia(ultima_propuesta)
+        ultima_propuesta = ""
+    else:
+        ultima_propuesta = respuesta
+
+
+def generar_sugerencia(idea):
+    """Gemini decide qué tocar (JSON con acordes) y sugerencia.py arma la pista y la propone."""
+    try:
+        archivo = os.path.join(proyectos.CARPETA, nombre + ".mid")
+        datos = gem.pedir_sugerencia_json(idea, correccion.midi_txt(archivo),
+                                          correccion.detectar_tonalidad(archivo))
+        sugerencia.proponer_sugerencia(datos, proyecto, nombre)   # "¿Aceptar sugerencia?" Sí / No
+        enviar_pistas()
+    except Exception as e:
+        print(f"No se pudo generar la sugerencia: {e}")
+        esp32.enviar("PANTALLA:PRINCIPAL")
+        gem.leer("Perdón, no pude preparar la sugerencia. Probemos de nuevo en un momento.", expresar=False)
+
+
+# =====================================================================
+#  Opciones de una pista (Pistas > pista elegida)
+# =====================================================================
+
+def atender_pista(canal, accion, valor):
+    if accion == "SOLA":       # Reproducir sola
+        reproducir.reproducir_pista(proyecto, canal)
+
+    elif accion == "INST" and valor is not None:   # Instrumento
+        proyectos.cambiar_instrumento(proyecto, canal, valor)
+        proyectos.guardar(proyecto, nombre)
+
+    elif accion == "IA":       # Generar con IA
+        generar_sugerencia(f"Un acompañamiento de acordes para {NOMBRE_PISTA.get(canal, 'esta pista')}")
+
+    elif accion == "BORRAR":   # Borrar
+        proyectos.borrar_pista(proyecto, canal)
+        proyectos.guardar(proyecto, nombre)
+        enviar_pistas()
+
+
+# =====================================================================
+#  Teclado
+# =====================================================================
+
 def tocar_teclado():
-    actual = esp32.instrumento_teclado
+    """Corre en su propio hilo: cada tecla suena al instante con el velocity que midió el ESP32."""
     while True:
         evento = esp32.leer_tecla()
-        # Si se eligió otro instrumento de teclado en la pantalla, se cambia en vivo.
-        if esp32.instrumento_teclado != actual:
-            actual = esp32.instrumento_teclado
-            reproducir.elegir_instrumento(actual)
         if evento is None:
             continue
         tipo, nota, velocidad = evento
@@ -45,184 +261,20 @@ def tocar_teclado():
         else:
             reproducir.soltar_nota(nota)
 
+        grabacion = grabacion_teclado   # copia local: el hilo principal la puede cambiar a None
+        if grabacion is not None:
+            grabacion.append((time.time() - inicio_teclado, tipo, nota, velocidad))
 
-def procesar_chat():
-    gem.responder("grabacion_chat.wav")
+
+def guardar_pista_teclado():
+    global grabacion_teclado
+    eventos, grabacion_teclado = grabacion_teclado, None
+    if not eventos:
+        return   # no se tocó nada
+    pista = proyectos.teclado_a_pista(eventos, CANAL_TECLADO, esp32.instrumento_teclado,
+                                      proyecto.ticks_per_beat)
+    agregar_pista(pista)
 
 
-def procesar_melodia(hay_esp32):
-    archivo_midi = convertir.conversion("grabacion_melodia.wav")
-    texto = correccion.midi_txt(archivo_midi)
-    if hay_esp32:
-        print("Elige en la pantalla del ESP32 el instrumento del micrófono y presiona el joystick para confirmar...")
-        instrumento = esp32.esperar_instrumento_microfono()
-    else:
-        print(instrumentos)
-        instrumento = int(input("Elige tu instrumento:"))
-
-    reproducir.reproducir_midi(archivo_midi, instrumento)
-
-    gem.analizar_midi(texto)
-
-instrumentos = """ Pianos (0-7)
-0: Piano de cola acústico
-1: Piano acústico brillante
-2: Piano de cola eléctrico
-3: Piano Honky-tonk
-4: Piano eléctrico 1 (Rhodes)
-5: Piano eléctrico 2 (Coro)
-6: Clave (Harpsichord)
-7: Clavinet
-
-Percusión Cromática (8-15)
-8: Celesta
-9: Glockenspiel
-10: Caja de música
-11: Vibráfono
-12: Marimba
-13: Xilófono
-14: Campanas tubulares
-15: Dulcémele (Dulcimer)
-
-Órganos (16-23)
-16: Órgano de barras (Hammond)
-17: Órgano percusivo
-18: Órgano rock
-19: Órgano de iglesia
-20: Armonio (Reed Organ)
-21: Acordeón
-22: Armónica
-23: Acordeón de tango (Bandoneón) 
-
-Guitarras (24-31)
-24: Guitarra acústica (nylon)
-25: Guitarra acústica (acero)
-26: Guitarra eléctrica (jazz)
-27: Guitarra eléctrica (limpia)
-28: Guitarra eléctrica (muteada)
-29: Guitarra sobrealimentada (overdrive)
-30: Guitarra distorsionada
-31: Armónicos de guitarra 
-
-Bajos (32-39)
-32: Bajo acústico
-33: Bajo eléctrico (dedos)
-34: Bajo eléctrico (púa)
-35: Bajo sin trastes (fretless)
-36: Bajo Slap 1
-37: Bajo Slap 2
-38: Bajo sintetizado 1
-39: Bajo sintetizado 2 
-
-Cuerdas Solo (40-47)
-40: Violín
-41: Viola
-42: Violonchelo (Cello)
-43: Contrabajo
-44: Cuerdas en trémolo
-45: Cuerdas en pizzicato
-46: Arpa orquestal
-47: Timbales
-
-Conjuntos (48-55)
-48: Conjunto de cuerdas 1
-49: Conjunto de cuerdas 2
-50: Cuerdas sintetizadas 1
-51: Cuerdas sintetizadas 2
-52: Coro "Aahs"
-53: Voces "Oohs"
-54: Voz sintetizada
-55: Golpe de orquesta (Orchestra Hit)
-
-Metales (56-63)
-56: Trompeta
-57: Trombón
-58: Tuba
-59: Trompeta con sordina
-60: Trompa (corno francés)
-61: Sección de metales
-62: Metales sintetizados 1
-63: Metales sintetizados 2
-
-Maderas (64-71)
-64: Saxofón soprano
-65: Saxofón alto
-66: Saxofón tenor
-67: Saxofón barítono
-68: Oboe
-69: Corno inglés
-70: Fagot
-71: Clarinete
-
-Viento (72-79)
-72: Pícolo
-73: Flauta
-74: Flauta dulce (Recorder)
-75: Flauta de Pan
-76: Soplido de botella
-77: Shakuhachi
-78: Silbido
-79: Ocarina
-
-Sintetizadores - Lead (80-87)
-80: Lead 1 (onda cuadrada)
-81: Lead 2 (onda de sierra)
-82: Lead 3 (calíope)
-83: Lead 4 (chiff)
-84: Lead 5 (charang)
-85: Lead 6 (voz)
-86: Lead 7 (quintas)
-87: Lead 8 (bajo + lead) 
-
-Sintetizadores - Pad (88-95)
-88: Pad 1 (new age)
-89: Pad 2 (cálido)
-90: Pad 3 (polysynth)
-91: Pad 4 (coro)
-92: Pad 5 (frotado)
-93: Pad 6 (metálico)
-94: Pad 7 (halo)
-95: Pad 8 (barrido) [1]
-
-Efectos de Sintetizador (96-103)
-96: FX 1 (lluvia)
-97: FX 2 (banda sonora)
-98: FX 3 (cristal)
-99: FX 4 (atmósfera)
-100: FX 5 (brillo)
-101: FX 6 (duendes)
-102: FX 7 (ecos)
-103: FX 8 (ciencia ficción)
-
-Étnicos (104-111)
-104: Sitar
-105: Banjo
-106: Shamisen
-107: Koto
-108: Kalimba
-109: Gaita
-110: Fiddle (Violín folk)
-111: Shanai 
-
-Percusión (112-119)
-112: Campanilla (Tinkle Bell)
-113: Agogô
-114: Tambores metálicos (Steel Drums)
-115: Woodblock
-116: Tambor Taiko
-117: Tom melódico
-118: Tambor sintetizado
-119: Platillo invertido
-Efectos de Sonido (120-127)
-120: Ruido de traste de guitarra
-121: Ruido de respiración
-122: Costa/Mar
-123: Canto de pájaro
-124: Timbre de teléfono
-125: Helicóptero
-126: Aplausos
-127: Disparo de arma
-""" 
-
-main()
-
+if __name__ == "__main__":
+    main()
