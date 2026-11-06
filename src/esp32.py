@@ -17,6 +17,7 @@ instrumento_teclado = None
 _nuevo_microfono = threading.Event()
 _nuevo_teclado = threading.Event()
 _teclas = queue.Queue()
+_botones = queue.Queue()
 
 
 def conectar():
@@ -72,6 +73,9 @@ def _escuchar():
             _teclas.put(("on", tecla_a_nota(int(partes[1])), velocidad))
         elif linea.startswith("OFF:") and linea[4:].isdigit():
             _teclas.put(("off", tecla_a_nota(int(linea[4:])), 0))
+        elif linea in _BOTONES:
+            # G:M1 / G:M0 (melodía) o G:C1 / G:C0 (chat)
+            _botones.put(_BOTONES[linea])
 
 
 def esperar_instrumento_microfono():
@@ -86,6 +90,25 @@ def esperar_instrumento_teclado():
     _nuevo_teclado.clear()     # descarta selecciones hechas antes de preguntar
     _nuevo_teclado.wait()
     return instrumento_teclado
+
+
+# ---------- Botones de grabación ----------
+_BOTONES = {
+    "G:M1": ("melodia", True),
+    "G:M0": ("melodia", False),
+    "G:C1": ("chat", True),
+    "G:C0": ("chat", False),
+}
+
+
+def leer_boton():
+    """Espera el próximo toque de un botón de grabación.
+    Devuelve ("melodia" | "chat", True al encender / False al apagar),
+    o None si no llegó nada en 1 s."""
+    try:
+        return _botones.get(timeout=1)
+    except queue.Empty:
+        return None
 
 
 # ---------- Teclado (74HC165) ----------

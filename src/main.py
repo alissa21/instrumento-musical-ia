@@ -3,7 +3,7 @@ import grabar, convertir, correccion, gem, reproducir, esp32
 
 
 def main():
-    gem.leer("Hola. Bienvenido a la estacion musical con Inteligencia Artificial, estoy aqui para ayudarte a componer y a acompañar tus ideas musicales. Cuando quieras, puedes presionar C para hablar conmigo, o R para grabar una melodia que deseas convertir en algun instrumento.")
+    gem.leer("Hola. Bienvenido a la estacion musical con Inteligencia Artificial, estoy aqui para ayudarte a componer y a acompañar tus ideas musicales. Cuando quieras, puedes presionar el boton de chat para hablar conmigo, o el boton de melodia para grabar una melodia que deseas convertir en algun instrumento.")
 
     hay_esp32 = esp32.conectar()
     if hay_esp32:
@@ -16,12 +16,12 @@ def main():
 
     try:
         while True:
-            tipo = grabar.grabar()  # "melodia" | "chat" | False al presionar x
+            tipo = grabar.grabar()  # "melodia" | "chat" | "" si quedó vacía | False si no hay ESP32
             if tipo == "melodia":
                 procesar_melodia(hay_esp32)
             elif tipo == "chat":
                 procesar_chat()
-            if not tipo:
+            if tipo is False:
                 break
     except KeyboardInterrupt:
         print("Saliendo...")

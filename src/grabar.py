@@ -1,7 +1,7 @@
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
-from pynput import keyboard
+import esp32
 
 # Configuraciones de audio
 fs = 44100  # Frecuencia de muestreo
@@ -17,63 +17,48 @@ def callback(indata, frames, time, status):
     if grabando and tipo == "chat":
         grabacion_chat.append(indata.copy())
 
-def on_press(key):
+
+# Espera los botones del ESP32: el primer toque (1) empieza a grabar, el segundo (0) termina
+def grabar():
     global grabando
     global tipo
-    global estado
-    if key == keyboard.KeyCode.from_char('r') or key == keyboard.KeyCode.from_char('c'):
-        estado = True
-        if key == keyboard.KeyCode.from_char('r'):
-            tipo = "melodia"
-        if key == keyboard.KeyCode.from_char('c'):
-            tipo = "chat"
 
-
-        if not grabando:
-            print("Iniciando grabación...")
-            grabando = True
-            
-        elif grabando:
-            print("Grabación guardada.")
-            grabando = False
-            # Detener el listener o romper el bucle
-            return False
-        
-    if key == keyboard.KeyCode.from_char('x'):
-        estado = False
+    if not esp32.conectar():
+        print("No se encontró el ESP32: no se puede grabar sin los botones.")
         return False
-    
 
-# Iniciar la escucha del teclado
-def grabar():
-    tipos = ""
-    with keyboard.Listener(on_press=on_press) as listener:
-     # Iniciar la grabación de audio en segundo plano
-         with sd.InputStream(callback=callback, samplerate=fs, channels=1):
-            print("Presione la tecla 'r' para comenzar a grabar melodia, para pausar grabacion vuelva a presionarla.")
-            print("Presione la tecla 'c' para comenzar a grabar mensaje a IA, para pausar grabacion vuelva a presionarla.")
-            print("Vuelva a presionar la tecla para guardar la grabacion")
-            print("Presione 'x' para salir del programa")
-            listener.join()
+    # Iniciar la grabación de audio en segundo plano
+    with sd.InputStream(callback=callback, samplerate=fs, channels=1):
+        print("Presione el boton de melodia para comenzar a grabar melodia, vuelva a presionarlo para guardar la grabacion.")
+        print("Presione el boton de chat para comenzar a grabar mensaje a IA, vuelva a presionarlo para guardar la grabacion.")
+        while True:
+            evento = esp32.leer_boton()
+            if evento is None:
+                continue
+            boton, encendido = evento
 
-    if not estado:
-        return estado
-    
+            if encendido and not grabando:
+                tipo = boton
+                grabando = True
+                print("Iniciando grabación...")
+            elif not encendido and grabando and boton == tipo:
+                grabando = False
+                print("Grabación guardada.")
+                break
+
     # Si detecta que hay bloques de audio en la grabacion, los guarda en un archivo
-    if len(grabacion_melodia) > 0:
+    if tipo == "melodia" and len(grabacion_melodia) > 0:
         audio_completo = np.concatenate(grabacion_melodia, axis=0)
         wav.write('grabacion_melodia.wav', fs, audio_completo)
         print("Archivo 'grabacion_melodia.wav' guardado.")
         grabacion_melodia.clear() #vacio para siguiente audio
-        tipos = "melodia"
-        return tipos
-    
-    if len(grabacion_chat) > 0:
+        return "melodia"
+
+    if tipo == "chat" and len(grabacion_chat) > 0:
         audio_completo = np.concatenate(grabacion_chat, axis=0)
         wav.write('grabacion_chat.wav', fs, audio_completo)
         print("Archivo 'grabacion_chat.wav' guardado.")
         grabacion_chat.clear() #vacio para siguiente audio
-        tipos = "chat"
-        return tipos
+        return "chat"
 
-    
+    return ""
