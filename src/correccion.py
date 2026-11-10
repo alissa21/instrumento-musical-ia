@@ -1,34 +1,51 @@
-import os
-from mido import MidiFile
-from music21 import converter, analysis
-# Cargar el archivo MIDI
-archivo = 'pruebas_sonido/grabacion_basic_pitc.mid'
+import mido
+from music21 import converter
 
-def deteccion_nota():
-    midi_stream = converter.parse(archivo)
-    # Analizar la tonalidad y escala
-    key = midi_stream.analyze('key')
-    print(f"Tonalidad detectada: {key.tonic.name} {key.mode}")
-    print(f"Escala: {key.pitches}")
 
-# 1. Cargar el archivo MIDI
-# archivo_midi = MidiFile('pruebas_sonido/grabacion_basic_pitc.mid')
+def detectar_tonalidad(archivo):
+    """Detecta la tonalidad y la escala de un archivo MIDI con music21, que aplica
+    algoritmos de teoría musical real. Devuelve la tonalidad (por ejemplo, C major).
+    Detecta escalas mayores y menores; si se quieren escalas más exóticas, music21
+    las tiene, pero hay que compararlas una por una con las notas."""
+    return converter.parse(archivo).analyze("key")
 
-# 2. Iterar sobre todas las pistas
+
+def _afinar(nota, escala):
+    """Si la nota no pertenece a la escala, la corre al semitono más cercano que sí."""
+    if nota % 12 in escala:
+        return nota
+    for paso in (1, -1):   # una nota desafinada queda a un semitono de la escala
+        if 0 <= nota + paso <= 127 and (nota + paso) % 12 in escala:
+            return nota + paso
+    return nota
+
+
+def corregir(archivo, tonalidad):
+    """Corrige los errores y la desafinación que pueda haber al cantar: cada nota
+    desviada se corre para que quede dentro de las notas de su escala y suene afinada.
+    Se hace con mido, que permite modificar archivos MIDI, y se guarda en el mismo archivo."""
+    escala = {p.pitchClass for p in tonalidad.pitches}
+    archivo_midi = mido.MidiFile(archivo)
+    for pista in archivo_midi.tracks:
+        for i, mensaje in enumerate(pista):
+            # La misma corrección para note_on y note_off: cada nota se apaga igual que se prendió.
+            if mensaje.type in ("note_on", "note_off"):
+                pista[i] = mensaje.copy(note=_afinar(mensaje.note, escala))
+    archivo_midi.save(archivo)
+
 
 def midi_txt(archivo):
-    archivo_midi = MidiFile(archivo)
+    """Gemini no es capaz de leer archivos MIDI. Esta función recorre el archivo nota por
+    nota y lo transforma en texto, con cada nota, su velocidad y su tiempo. Ese texto es
+    el que se le envía a la IA para que pueda comprenderlo y dar sugerencias musicales."""
+    archivo_midi = mido.MidiFile(archivo)
     texto = " "
-    for i, pista in enumerate(archivo_midi.tracks):   
+    for pista in archivo_midi.tracks:
         tiempo_acumulado = 0
-    
         for mensaje in pista:
-        # Los mensajes tienen un tiempo "delta" (tiempo desde el evento anterior)
+            # Los mensajes tienen un tiempo "delta" (tiempo desde el evento anterior)
             tiempo_acumulado += mensaje.time
-        
-        # Filtrar solo los mensajes de nota musical
-            if mensaje.type == 'note_on' and mensaje.velocity > 0:
-                texto = f"{texto} \n Nota: {mensaje.note} | Velocidad:  {mensaje.velocity} |Canal: {mensaje.channel} | Tiempo: {tiempo_acumulado}"
-                # print(texto)
-
+            # Filtrar solo los mensajes de nota musical
+            if mensaje.type == "note_on" and mensaje.velocity > 0:
+                texto = f"{texto} \n Nota: {mensaje.note} | Velocidad: {mensaje.velocity} | Canal: {mensaje.channel} | Tiempo: {tiempo_acumulado}"
     return texto
