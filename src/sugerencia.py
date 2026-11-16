@@ -3,6 +3,7 @@ import random
 import mido
 from music21 import harmony
 
+import acompanante
 import esp32
 import gem
 import proyectos
@@ -76,6 +77,27 @@ def grilla_de_pulso(onsets, ticks_por_tiempo):
 #  Sugerencia -> MIDI
 # =====================================================================
 
+def _instrumento(datos):
+    """Instrumento que eligió Gemini (0-127 de General MIDI). Si mandó cualquier cosa: piano."""
+    instrumento = datos.get("instrumento", 0)
+    return instrumento if isinstance(instrumento, int) and 0 <= instrumento <= 127 else 0
+
+
+def _armar_pista(eventos, canal, instrumento):
+    """Arma la pista "Sugerencia IA" a partir de pares (tick absoluto, mensaje)."""
+    # De tiempos absolutos a tiempos delta (lo que mido espera). Los note_off van
+    # antes que los note_on del mismo instante para no cortar una nota recién tocada.
+    eventos.sort(key=lambda e: (e[0], 0 if e[1].type == "note_off" else 1))
+    pista = mido.MidiTrack()
+    pista.append(mido.MetaMessage("track_name", name="Sugerencia IA"))
+    pista.append(mido.Message("program_change", channel=canal, program=instrumento, time=0))
+    anterior = 0
+    for t, msg in eventos:
+        pista.append(msg.copy(time=t - anterior))
+        anterior = t
+    return pista
+
+
 def sugerencia_a_midi(datos, canal, grilla, pulso):
     """Convierte la sugerencia de Gemini (un diccionario leído de su JSON) en una
     pista MIDI tocada con patrón. Gemini decide QUÉ tocar (los acordes en cifrado
@@ -83,10 +105,6 @@ def sugerencia_a_midi(datos, canal, grilla, pulso):
     el acorde se vuelve a golpear en cada pulso de la grilla, con el bajo en el
     primer golpe, acento, velocities variadas y notas que terminan un poco antes
     del golpe siguiente."""
-    instrumento = datos.get("instrumento", 0)
-    if not isinstance(instrumento, int) or not 0 <= instrumento <= 127:
-        instrumento = 0   # la IA mandó cualquier cosa: piano
-
     eventos = []  # pares (tick absoluto, mensaje); al final se pasan a tiempos delta
     i = 0         # posición en la grilla
 
@@ -126,23 +144,30 @@ def sugerencia_a_midi(datos, canal, grilla, pulso):
                 eventos.append((inicio + duracion, mido.Message("note_off", channel=canal, note=n, velocity=0)))
             i += 1
 
-    # De tiempos absolutos a tiempos delta (lo que mido espera). Los note_off van
-    # antes que los note_on del mismo instante para no cortar una nota recién tocada.
-    eventos.sort(key=lambda e: (e[0], 0 if e[1].type == "note_off" else 1))
-    pista = mido.MidiTrack()
-    pista.append(mido.MetaMessage("track_name", name="Sugerencia IA"))
-    pista.append(mido.Message("program_change", channel=canal, program=instrumento, time=0))
-    anterior = 0
-    for t, msg in eventos:
-        pista.append(msg.copy(time=t - anterior))
-        anterior = t
-    return pista
+    return _armar_pista(eventos, canal, _instrumento(datos))
 
 
-def proponer_sugerencia(datos, proyecto, nombre, canal_melodia=0):
-    """Arma la pista de la sugerencia, la hace escuchar junto con el resto del proyecto
-    y pregunta en la pantalla "¿Aceptar sugerencia?". Devuelve True si se aceptó.
-    canal_melodia = canal de la pista a la que acompaña."""
+def pista_con_midigpt(datos, proyecto, canal_melodia=0):
+    """Arma la pista de la sugerencia con MIDI-GPT: Gemini eligió el instrumento y el carácter
+    (datos) y el modelo escribe las notas escuchando las pistas que ya tiene el proyecto.
+    canal_melodia = canal de la pista a la que acompaña (de ahí sale el pulso)."""
+    onsets = onsets_melodia(proyecto, canal_melodia)
+    _, pulso = grilla_de_pulso(onsets, proyecto.ticks_per_beat)
+    # El modelo escucha todo menos la sugerencia anterior, que es la que se va a reemplazar.
+    contexto = [p for p in proyecto.tracks if proyectos.canal_de_pista(p) not in (None, CANAL_IA)]
+    with gem.cronometro("MIDI-GPT (escribir las notas)"):
+        notas = acompanante.generar(contexto, proyecto.ticks_per_beat, onsets, pulso, datos)
+
+    eventos = []
+    for inicio, fin, nota, velocity in notas:
+        eventos.append((inicio, mido.Message("note_on", channel=CANAL_IA, note=nota, velocity=velocity)))
+        eventos.append((fin, mido.Message("note_off", channel=CANAL_IA, note=nota, velocity=0)))
+    return _armar_pista(eventos, CANAL_IA, _instrumento(datos))
+
+
+def pista_con_acordes(datos, proyecto, canal_melodia=0):
+    """Método anterior, que queda como respaldo: Gemini dice los acordes y Python los toca
+    con un patrón sobre la grilla de pulso."""
     # La grilla sale de la melodía ya grabada: el acompañamiento cae donde
     # el usuario cantó, no donde diga un reloj.
     onsets = onsets_melodia(proyecto, canal_melodia)
@@ -152,7 +177,12 @@ def proponer_sugerencia(datos, proyecto, nombre, canal_melodia=0):
         # Todos los acordes estaban mal escritos: no hay nada para escuchar.
         # main.generar_sugerencia() atrapa el error, vuelve a la pantalla principal y avisa.
         raise ValueError(f"la IA no devolvió ningún acorde que se pueda tocar: {datos}")
+    return pista
 
+
+def proponer_sugerencia(pista, proyecto, nombre):
+    """Hace escuchar la pista de la sugerencia junto con el resto del proyecto y pregunta
+    en la pantalla "¿Aceptar sugerencia?". Devuelve True si se aceptó."""
     # Copia del proyecto con la sugerencia, solo para escucharla (sin tocar el proyecto guardado).
     # Si ya había una sugerencia aceptada antes, en la prueba se escucha la nueva en su lugar.
     prueba = mido.MidiFile(type=1, ticks_per_beat=proyecto.ticks_per_beat)

@@ -223,24 +223,37 @@ def procesar_chat():
         return   # no se entendió nada
     mensaje, respuesta = resultado
 
-    # Si el usuario está de acuerdo con la idea que propuso la IA, se arma y se reproduce.
-    if ultima_propuesta and gem.acepto_sugerencia(ultima_propuesta, mensaje):
-        generar_sugerencia(ultima_propuesta)
+    # Si el usuario acepta la idea que propuso la IA, o pide directamente una sugerencia,
+    # se arma y se reproduce. Se pasa también su mensaje, por si pidió algo puntual
+    # (por ejemplo "que no sea de piano"), y la respuesta que la IA le acaba de dar.
+    if gem.acepto_sugerencia(ultima_propuesta, mensaje):
+        generar_sugerencia(f"Propuesta anterior de la IA: {ultima_propuesta}\n"
+                           f"Pedido del usuario: {mensaje}\n"
+                           f"Respuesta de la IA a ese pedido: {respuesta}")
         ultima_propuesta = ""
     else:
         ultima_propuesta = respuesta
 
 
 def generar_sugerencia(idea, canal=None):
-    """Gemini decide qué tocar (JSON con acordes) y sugerencia.py arma la pista y la propone.
+    """Gemini elige el instrumento y el carácter de la pista, MIDI-GPT escribe las notas y
+    sugerencia.py la propone. Si MIDI-GPT falla, se usa el método anterior (Gemini dice los acordes).
     canal = pista a la que acompaña (de ahí sale el pulso); sin canal, la última melodía grabada."""
     if canal is None or canal == CANAL_IA:
         canal = ultima_melodia
     try:
         archivo = os.path.join(proyectos.CARPETA, nombre + ".mid")
         tonalidad = correccion.texto_tonalidad(correccion.detectar_tonalidad(archivo))
-        datos = gem.pedir_sugerencia_json(idea, correccion.midi_txt(archivo), tonalidad)
-        sugerencia.proponer_sugerencia(datos, proyecto, nombre, canal)   # "¿Aceptar sugerencia?" Sí / No
+        melodia_txt = correccion.midi_txt(archivo)
+        try:
+            datos = gem.pedir_arreglo_json(idea, melodia_txt, tonalidad)
+            print(f"Arreglo pedido a MIDI-GPT: {datos}")
+            pista = sugerencia.pista_con_midigpt(datos, proyecto, canal)
+        except Exception as e:
+            print(f"MIDI-GPT no pudo generar ({e}). Se usan los acordes de Gemini.")
+            datos = gem.pedir_sugerencia_json(idea, melodia_txt, tonalidad)
+            pista = sugerencia.pista_con_acordes(datos, proyecto, canal)
+        sugerencia.proponer_sugerencia(pista, proyecto, nombre)   # "¿Aceptar sugerencia?" Sí / No
         enviar_pistas()
     except Exception as e:
         print(f"No se pudo generar la sugerencia: {e}")

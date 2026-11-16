@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
 
 from dotenv import load_dotenv
 from google import genai
@@ -23,7 +24,19 @@ import reproducir
 
 load_dotenv()
 
-MODELO = "gemini-3.5-flash"
+MODELO = "gemini-3.5-flash-lite"
+
+
+@contextmanager
+def cronometro(etapa):
+    """Imprime cuánto tardó una etapa, por ejemplo "[tiempo] ElevenLabs (texto a voz): 2.4 s".
+    Se usa con "with cronometro(...):" alrededor de cada pedido por internet, para ver
+    en la consola cuál es el que demora cuando el asistente tarda en responder."""
+    inicio = time.perf_counter()
+    try:
+        yield
+    finally:   # también cuando el pedido falla: interesa saber cuánto esperó
+        print(f"[tiempo] {etapa}: {time.perf_counter() - inicio:.1f} s")
 
 # =====================================================================
 #  Transcripción de voz a texto (Whisper en Groq)
@@ -67,7 +80,8 @@ def transcribir(archivo):
     frecuencia, datos = _leer_audio(archivo)
     if datos.size == 0 or np.abs(datos).max() < NIVEL_SILENCIO:
         return ""   # solo silencio: responder() lo toma como "no se entendió nada"
-    texto = _transcribir_audio(archivo, frecuencia, datos)
+    with cronometro("Whisper (voz a texto)"):
+        texto = _transcribir_audio(archivo, frecuencia, datos)
     return "" if FRASES_INVENTADAS.search(texto) else texto
 
 
@@ -104,8 +118,10 @@ instrucciones_del_sistema = (
     "2. Nunca sugieras nada sin antes hacer preguntas. Cuando el usuario comparta una melodía o idea, "
     "primero pregúntale qué quiere expresar con ella, qué estilo o artista lo inspira, y qué emoción quiere generar. "
     "Haz una sola pregunta por vez y espera la respuesta antes de continuar.\n"
-    "3. Una vez que tengas contexto suficiente, haz UNA sola sugerencia concreta. "
-    "Puede ser una progresión de acordes, una línea de bajo, un ritmo o una textura, pero solo una. "
+    "3. Una vez que tengas contexto suficiente, haz UNA sola sugerencia concreta: qué instrumento agregar "
+    "y con qué carácter (si toca una nota por vez o acordes, con notas largas o cortas, en un registro "
+    "grave o agudo, con mucho o poco espacio entre las notas). No nombres acordes ni notas puntuales: "
+    "las notas las escribe otro sistema a partir de tu descripción, escuchando la melodía. "
     "Después de darla, pregunta si quiere escucharla o si prefiere explorar otra dirección.\n"
     "4. Cuando el usuario acepta una sugerencia, el sistema la toca automáticamente junto con su melodía. "
     "En ese caso responde con una sola frase corta, por ejemplo avisando que ya la va a escuchar.\n"
@@ -114,7 +130,12 @@ instrucciones_del_sistema = (
     "7. Rechaza cualquier conversación que no esté relacionada con música, composición o producción."
 )
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# Por defecto la librería de Gemini no tiene límite de espera: si un pedido queda colgado
+# (pasa cuando se agota el cupo o el servidor está saturado), el programa se queda trabado
+# sin avisar. Con este límite, a los 30 s se corta y se sigue (el número va en milisegundos).
+ESPERA_GEMINI_MS = 30_000
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                      http_options=types.HttpOptions(timeout=ESPERA_GEMINI_MS))
 
 # El chat guarda el historial, así Gemini recuerda cada mensaje de la conversación.
 mi_chat_gemini = client.chats.create(
@@ -128,9 +149,19 @@ mi_chat_gemini = client.chats.create(
 
 def hablar_con_mi_gem(mensaje):
     try:
-        return mi_chat_gemini.send_message(mensaje).text
+        with cronometro("Gemini (respuesta)"):
+            respuesta = mi_chat_gemini.send_message(mensaje)
+        if respuesta.text:
+            return respuesta.text
+        # A veces Gemini responde sin texto (por ejemplo, si bloquea la respuesta).
+        # Sin este control, el None seguía hasta la voz y cortaba el programa.
+        motivo = respuesta.candidates[0].finish_reason if respuesta.candidates else respuesta.prompt_feedback
+        print(f"Gemini respondió sin texto (motivo: {motivo}).")
+        return "Perdón, no me salió la respuesta. ¿Me lo puedes decir de otra forma?"
     except Exception as e:
         print(f"Error al conectar con Gemini: {e}")
+        if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):   # se agotó el cupo de pedidos
+            return "Se me acabó el cupo de respuestas de Gemini. Espera un rato y vuelve a intentarlo."
         return "Perdón, no me pude conectar. ¿Puedes repetirlo en un momento?"
 
 
@@ -170,14 +201,15 @@ INSTRUCCIONES_EXPRESION = (
 def agregar_expresion(texto):
     """Pedido aparte del chat: agrega etiquetas de audio sin cambiar ninguna palabra."""
     try:
-        respuesta = client.models.generate_content(
-            model=MODELO,
-            contents=texto,
-            config=types.GenerateContentConfig(
-                system_instruction=INSTRUCCIONES_EXPRESION,
-                temperature=0.3,
-            ),
-        )
+        with cronometro("Gemini (etiquetas de emoción)"):
+            respuesta = client.models.generate_content(
+                model=MODELO,
+                contents=texto,
+                config=types.GenerateContentConfig(
+                    system_instruction=INSTRUCCIONES_EXPRESION,
+                    temperature=0.3,
+                ),
+            )
         return respuesta.text.strip()
     except Exception:
         return texto  # si falla, la voz sale igual, sin etiquetas
@@ -204,15 +236,17 @@ def texto_a_voz(texto, expresar=True):
     try:
         if cliente_voz is None:
             raise RuntimeError("falta ELEVENLABS_API_KEY")
-        audio = cliente_voz.text_to_speech.convert(
-            text=agregar_expresion(texto) if expresar else texto,  # con etiquetas de audio
-            voice_id=VOCES[voz_actual],
-            model_id="eleven_v4_turbo",
-            output_format="mp3_44100_128",
-        )
-        with open("respuesta_ia.mp3", "wb") as f:
-            for parte in audio:  # el audio llega en partes y se van escribiendo
-                f.write(parte)
+        texto_con_etiquetas = agregar_expresion(texto) if expresar else texto  # con etiquetas de audio
+        with cronometro("ElevenLabs (texto a voz)"):
+            audio = cliente_voz.text_to_speech.convert(
+                text=texto_con_etiquetas,
+                voice_id=VOCES[voz_actual],
+                model_id="eleven_v4_turbo",
+                output_format="mp3_44100_128",
+            )
+            with open("respuesta_ia.mp3", "wb") as f:
+                for parte in audio:  # el audio llega en partes y se van escribiendo
+                    f.write(parte)
         return "respuesta_ia.mp3"
 
     except Exception as e:
@@ -311,26 +345,78 @@ def analizar_midi(midi_txt, tonalidad):
 INSTRUCCIONES_ACEPTA = (
     "Recibís la última propuesta musical que hizo un asistente y lo que le respondió la persona. "
     "Respondé solamente SI si la persona está de acuerdo con la propuesta y quiere escucharla, "
-    "o NO en cualquier otro caso."
+    "o si pide directamente que le crees, generes o hagas escuchar una sugerencia o un acompañamiento "
+    "(aunque no haya propuesta anterior), o si pide un cambio concreto sobre la sugerencia que acaba "
+    "de escuchar (por ejemplo más grave, con menos notas o con otro instrumento). "
+    "Respondé NO en cualquier otro caso."
 )
 
 
 def acepto_sugerencia(propuesta, mensaje):
     try:
-        respuesta = client.models.generate_content(
-            model=MODELO,
-            contents=f"Propuesta del asistente: {propuesta}\nRespuesta de la persona: {mensaje}",
-            config=types.GenerateContentConfig(
-                system_instruction=INSTRUCCIONES_ACEPTA,
-                temperature=0,  # respuesta exacta, sin creatividad
-            ),
-        )
+        with cronometro("Gemini (¿aceptó la propuesta?)"):
+            respuesta = client.models.generate_content(
+                model=MODELO,
+                contents=f"Propuesta del asistente: {propuesta}\nRespuesta de la persona: {mensaje}",
+                config=types.GenerateContentConfig(
+                    system_instruction=INSTRUCCIONES_ACEPTA,
+                    temperature=0,  # respuesta exacta, sin creatividad
+                ),
+            )
         return respuesta.text.strip().upper().startswith("SI")
     except Exception:
         return False
 
 
-# ---------- Sugerencia en formato JSON ----------
+# ---------- Arreglo en formato JSON (para MIDI-GPT) ----------
+# Gemini no escribe las notas: elige el instrumento y el carácter de la pista, y con eso
+# MIDI-GPT (acompanante.py) escribe las notas. Las palabras de cada campo son las que
+# acompanante.py sabe traducir a los controles del modelo.
+class Arreglo(BaseModel):
+    instrumento: int   # número 0-127 de General MIDI
+    voces: int         # notas que suenan a la vez: 1 = una sola, 3 o 4 = acordes
+    notas: str         # "cortas", "medias" o "largas"
+    espacio: str       # "poco", "medio" o "mucho" silencio entre las notas
+    registro: str      # "grave", "medio" o "agudo"
+
+
+ultimo_arreglo = None   # el último que se pidió, para que "más grave" o "menos notas" parta de ahí
+
+
+def pedir_arreglo_json(idea_aceptada, melodia_txt, tonalidad):
+    global ultimo_arreglo
+    pedido = (
+        "Convertí esta sugerencia musical en los datos de UNA pista nueva de acompañamiento:\n"
+        "- instrumento: número 0-127 de General MIDI (por ejemplo 0 piano, 25 guitarra acústica, "
+        "33 bajo eléctrico, 48 cuerdas, 73 flauta). No elijas batería ni percusión.\n"
+        "- voces: cuántas notas suenan a la vez, de 1 a 4. Usá 1 para un bajo o una melodía "
+        "y 3 o 4 para acordes.\n"
+        "- notas: \"cortas\", \"medias\" o \"largas\".\n"
+        "- espacio: cuánto silencio deja entre las notas: \"poco\", \"medio\" o \"mucho\".\n"
+        "- registro: \"grave\", \"medio\" o \"agudo\". Si no se pide otra cosa, elegí uno distinto "
+        "al de la melodía para que no se pisen.\n"
+        f"Sugerencia aceptada: {idea_aceptada}\n"
+        f"Tonalidad de la melodía: {tonalidad}\n"
+        f"Melodía: {melodia_txt}"
+    )
+    if ultimo_arreglo:
+        pedido += ("\nDatos de la sugerencia anterior, por si el usuario pide un cambio sobre ella "
+                   f"(si pide algo nuevo, ignoralos): {json.dumps(ultimo_arreglo)}")
+    with cronometro("Gemini (instrumento y carácter)"):
+        respuesta = client.models.generate_content(
+            model=MODELO,
+            contents=pedido,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",  # obliga a responder en JSON
+                response_schema=Arreglo,                # ...y con esta forma exacta
+                temperature=0.3,
+            ),
+        )
+    ultimo_arreglo = json.loads(respuesta.text)  # convierte el texto JSON en un diccionario
+    return ultimo_arreglo
+
+
+# ---------- Sugerencia en formato JSON (método anterior, queda como respaldo) ----------
 # Forma exacta que tiene que tener el JSON. Con response_schema, Gemini está obligado
 # a responder con estas claves y estos tipos (sin esto a veces inventa otra estructura).
 class Acorde(BaseModel):

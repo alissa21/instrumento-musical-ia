@@ -56,3 +56,6 @@ def midi_txt(archivo):
             if mensaje.type == "note_on" and mensaje.velocity > 0:
                 texto = f"{texto} \n Nota: {mensaje.note} | Velocidad: {mensaje.velocity} | Canal: {mensaje.channel} | Tiempo: {tiempo_acumulado}"
     return texto
+
+
+    
