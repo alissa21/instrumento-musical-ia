@@ -7,15 +7,17 @@ import grabar, convertir, correccion, gem, reproducir, esp32, proyectos, sugeren
 
 CONFIG = "config.json"
 
-# Cada tipo de pista usa siempre el mismo canal MIDI (ver Multipista con FluidSynth)
+# Canal MIDI de cada tipo de pista (ver Multipista con FluidSynth). La primera melodía y el
+# primer teclado usan estos canales; las grabaciones siguientes, el primero que esté libre
+# (proyectos.canal_libre). La sugerencia de la IA es una sola y siempre va al canal 2.
 CANAL_MELODIA = 0
 CANAL_TECLADO = 1
 CANAL_IA = 2
-NOMBRE_PISTA = {CANAL_MELODIA: "la melodía", CANAL_TECLADO: "el teclado", CANAL_IA: "la sugerencia de la IA"}
 
 proyecto = None            # proyecto abierto (archivo MIDI multipista) o None en la pantalla de inicio
 nombre = None              # nombre del archivo del proyecto, sin .mid
 ultima_propuesta = ""      # última idea que propuso la IA, por si el usuario la acepta
+ultima_melodia = CANAL_MELODIA   # canal de la última melodía grabada: la IA acompaña a esa
 grabacion_teclado = None   # notas tocadas mientras se graba el teclado (None = no se está grabando)
 inicio_teclado = 0.0
 
@@ -41,8 +43,9 @@ def primer_inicio():
     esp32.enviar("PANTALLA:BIENVENIDA")
     voz = esp32.esperar_voz()   # después de elegirla, el ESP32 muestra solo la pantalla del micrófono
     gem.voz_actual = voz
-    gem.leer("[warmly] Hola, voy a ser tu asistente musical. ¿Cómo te llamas? "
-             "Presiona el botón de chat, dime tu nombre y vuelve a presionarlo.", expresar=False)
+    # Siempre es la misma frase: se reproduce el audio ya grabado con la voz elegida.
+    gem.decir_frase("bienvenida", "[warmly] Hola, voy a ser tu asistente musical. ¿Cómo te llamas? "
+                    "Presiona el botón de chat, dime tu nombre y vuelve a presionarlo.")
     usuario = proyectos.pedir_nombre("usuario")   # micrófono y "¿Es correcto?"
     guardar_config(usuario, voz)
     return {"usuario": usuario, "voz": voz}
@@ -85,13 +88,14 @@ def main():
 
 def atender(pedido, config):
     """Hace lo que se pidió desde el ESP32 (botones y opciones del menú)."""
-    global proyecto, nombre
+    global proyecto, nombre, ultima_melodia
     tipo = pedido[0]
 
     # ----- Pantalla de inicio -----
     if tipo == "NUEVO":
         nombre = proyectos.preguntar_nombre_proyecto()   # "¿Deseas ponerle un nombre al proyecto?"
         proyecto = proyectos.nuevo()
+        ultima_melodia = CANAL_MELODIA
         proyectos.guardar(proyecto, nombre)
         abrir_pantalla_principal()
 
@@ -100,6 +104,7 @@ def atender(pedido, config):
         if pedido[1] < len(nombres):
             nombre = nombres[pedido[1]]
             proyecto = proyectos.abrir(nombre)
+            ultima_melodia = CANAL_MELODIA
             abrir_pantalla_principal()
             reproducir.reproducir_proyecto(proyecto)
 
@@ -113,7 +118,7 @@ def atender(pedido, config):
     elif tipo == "VOZ":   # Ajustes > Voz de la IA (esp32.py ya cambió gem.voz_actual)
         config["voz"] = pedido[1]
         guardar_config(config["usuario"], config["voz"])
-        gem.leer("[cheerfully] ¡Hola! Así suena mi nueva voz.", expresar=False)
+        gem.decir_frase("nueva_voz", "[cheerfully] ¡Hola! Así suena mi nueva voz.")
 
     # ----- Dentro de un proyecto -----
     elif proyecto is None:
@@ -143,8 +148,10 @@ def abrir_pantalla_principal():
 
 
 def enviar_pistas():
-    """Le manda al ESP32 los canales de las pistas del proyecto, por ejemplo PISTAS:0,1,2."""
-    esp32.enviar("PISTAS:" + ",".join(str(canal) for canal in proyectos.canales(proyecto)))
+    """Le manda al ESP32 las pistas del proyecto, cada una con su canal y su nombre,
+    por ejemplo PISTAS:0=Melodia,3=Melodia 2,2=Sugerencia IA."""
+    esp32.enviar("PISTAS:" + ",".join(f"{canal}={proyectos.sin_tildes(nombre_pista)}"
+                                      for canal, nombre_pista in proyectos.nombres(proyecto)))
 
 
 def agregar_pista(pista):
@@ -152,6 +159,15 @@ def agregar_pista(pista):
     proyectos.poner_pista(proyecto, pista)
     proyectos.guardar(proyecto, nombre)   # se guarda cada vez que se agrega una pista
     enviar_pistas()
+
+
+def canal_para_grabar(preferido):
+    """Canal libre para una grabación nueva, o None (y lo avisa) si el proyecto ya está lleno."""
+    canal = proyectos.canal_libre(proyecto, preferido)
+    if canal is None:
+        gem.leer("Este proyecto ya no tiene lugar para más pistas. Borra alguna y vuelve a grabar.",
+                 expresar=False)
+    return canal
 
 
 # =====================================================================
@@ -181,18 +197,23 @@ def atender_boton(pedido):
 
 
 def procesar_melodia():
-    global ultima_propuesta
+    global ultima_propuesta, ultima_melodia
+    canal = canal_para_grabar(CANAL_MELODIA)   # cada melodía va a una pista nueva
+    if canal is None:
+        return
     archivo_midi = convertir.conversion("grabacion_melodia.wav")   # Basic Pitch
     tonalidad = correccion.detectar_tonalidad(archivo_midi)        # music21
     correccion.corregir(archivo_midi, tonalidad)                   # afina las notas dentro de la escala
 
     # La pista se crea con el instrumento elegido en ese momento para el micrófono.
-    pista = proyectos.midi_a_pista(archivo_midi, CANAL_MELODIA, esp32.instrumento_microfono,
-                                   proyecto.ticks_per_beat)
+    pista = proyectos.midi_a_pista(archivo_midi, proyectos.nombre_libre(proyecto, "Melodia"), canal,
+                                   esp32.instrumento_microfono, proyecto.ticks_per_beat)
     agregar_pista(pista)
+    ultima_melodia = canal
     reproducir.reproducir_proyecto(proyecto)
 
-    ultima_propuesta = gem.analizar_midi(correccion.midi_txt(archivo_midi), tonalidad)
+    ultima_propuesta = gem.analizar_midi(correccion.midi_txt(archivo_midi),
+                                         correccion.texto_tonalidad(tonalidad))
 
 
 def procesar_chat():
@@ -210,13 +231,16 @@ def procesar_chat():
         ultima_propuesta = respuesta
 
 
-def generar_sugerencia(idea):
-    """Gemini decide qué tocar (JSON con acordes) y sugerencia.py arma la pista y la propone."""
+def generar_sugerencia(idea, canal=None):
+    """Gemini decide qué tocar (JSON con acordes) y sugerencia.py arma la pista y la propone.
+    canal = pista a la que acompaña (de ahí sale el pulso); sin canal, la última melodía grabada."""
+    if canal is None or canal == CANAL_IA:
+        canal = ultima_melodia
     try:
         archivo = os.path.join(proyectos.CARPETA, nombre + ".mid")
-        datos = gem.pedir_sugerencia_json(idea, correccion.midi_txt(archivo),
-                                          correccion.detectar_tonalidad(archivo))
-        sugerencia.proponer_sugerencia(datos, proyecto, nombre)   # "¿Aceptar sugerencia?" Sí / No
+        tonalidad = correccion.texto_tonalidad(correccion.detectar_tonalidad(archivo))
+        datos = gem.pedir_sugerencia_json(idea, correccion.midi_txt(archivo), tonalidad)
+        sugerencia.proponer_sugerencia(datos, proyecto, nombre, canal)   # "¿Aceptar sugerencia?" Sí / No
         enviar_pistas()
     except Exception as e:
         print(f"No se pudo generar la sugerencia: {e}")
@@ -237,7 +261,8 @@ def atender_pista(canal, accion, valor):
         proyectos.guardar(proyecto, nombre)
 
     elif accion == "IA":       # Generar con IA
-        generar_sugerencia(f"Un acompañamiento de acordes para {NOMBRE_PISTA.get(canal, 'esta pista')}")
+        generar_sugerencia(f"Un acompañamiento de acordes para la pista "
+                           f"{proyectos.nombre_de(proyecto, canal)}", canal)
 
     elif accion == "BORRAR":   # Borrar
         proyectos.borrar_pista(proyecto, canal)
@@ -271,8 +296,11 @@ def guardar_pista_teclado():
     eventos, grabacion_teclado = grabacion_teclado, None
     if not eventos:
         return   # no se tocó nada
-    pista = proyectos.teclado_a_pista(eventos, CANAL_TECLADO, esp32.instrumento_teclado,
-                                      proyecto.ticks_per_beat)
+    canal = canal_para_grabar(CANAL_TECLADO)   # cada grabación del teclado va a una pista nueva
+    if canal is None:
+        return
+    pista = proyectos.teclado_a_pista(eventos, proyectos.nombre_libre(proyecto, "Teclado"), canal,
+                                      esp32.instrumento_teclado, proyecto.ticks_per_beat)
     agregar_pista(pista)
 
 

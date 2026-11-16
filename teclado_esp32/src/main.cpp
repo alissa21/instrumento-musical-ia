@@ -43,6 +43,9 @@ const bool INVERTIR_Y = true;    // cambiar si arriba/abajo quedan al revés
 // ---------- Botones de control y potenciómetro ----------
 const unsigned long ANTIRREBOTE_BOTON_MS = 50;
 const unsigned long PERIODO_POT = 20;   // ms entre lecturas del potenciómetro
+// false si el potenciómetro no está conectado: el GPIO36 no tiene pull-up interno y,
+// al aire, mandaría valores al azar (el volumen subiría y bajaría solo).
+const bool HAY_POTENCIOMETRO = false;
 
 // ---------- Diseño de la pantalla (480x320 horizontal) ----------
 // Listas (menús con desplazamiento)
@@ -122,7 +125,7 @@ const char* const INSTRUMENTOS[NUM_INSTRUMENTOS] = {
 };
 
 // Las fuentes de la pantalla no tienen tildes ni signos de apertura (¿ ¡), por eso no se usan.
-const char* const VOCES[4] = { "Voz 1", "Voz 2", "Voz 3", "Voz 4" };
+const char* const VOCES[4] = { "Maya", "Antonio", "Sol", "Mario" };
 const char* const OPCIONES_INICIO[2] = { "Crear nuevo proyecto", "Proyectos" };
 const char* const OPCIONES_DE_PISTA[6] = {
   "Reproducir sola", "Instrumento", "Mover en el tiempo", "Efectos", "Generar con IA", "Borrar"
@@ -169,6 +172,7 @@ String proyectoActual = "";
 String proyectos[MAX_PROYECTOS];
 int cantidadProyectos = 0;
 int pistas[MAX_PISTAS];        // canal MIDI de cada pista del proyecto abierto
+String nombresPistas[MAX_PISTAS];   // nombre de cada pista, en el mismo orden ("Melodia 2")
 int cantidadPistas = 0;
 String nombreTranscripto = "";
 
@@ -378,7 +382,11 @@ void mostrarMensaje(const char* texto) {
   textoCentrado(texto, tft.height() / 2, TFT_CYAN, 4);
 }
 
+// Nombre de la pista de ese canal: el que mandó Python o, si no mandó ninguno, el del canal.
 String nombrePista(int canal) {
+  for (int i = 0; i < cantidadPistas; i++) {
+    if (pistas[i] == canal && nombresPistas[i].length() > 0) return nombresPistas[i];
+  }
   if (canal == 0) return "Melodia";
   if (canal == 1) return "Teclado";
   if (canal == 2) return "Sugerencia IA";
@@ -513,6 +521,15 @@ void dibujarVolver() {
   tft.fillRect(cx - 4, cy - 4, 20, 9, flecha);                                // palo
 }
 
+// En la lista de voces, avisa a Python qué voz quedó marcada para que reproduzca su muestra.
+// Se llama solo cuando el cursor llega a una voz (no en cada vuelta del loop),
+// así la muestra suena una vez y no se repite mientras el cursor se queda ahí.
+void avisarVozMarcada() {
+  if (pantalla == ELEGIR_VOZ && foco == FOCO_LISTA) {
+    Serial.printf("MARCA:VOZ:%d\n", indice);
+  }
+}
+
 // Abre una lista con la opción "marcado" ya marcada.
 void abrirLista(Pantalla p, int marcado) {
   pantalla = p;
@@ -534,6 +551,7 @@ void abrirLista(Pantalla p, int marcado) {
   }
   dibujarLista();
   dibujarVolver();
+  avisarVozMarcada();   // al abrir la lista de voces, suena la que está marcada
 }
 
 void cambiarFoco(Foco nuevo) {
@@ -541,6 +559,7 @@ void cambiarFoco(Foco nuevo) {
   foco = nuevo;
   dibujarFila(indice);   // la fila marcada cambia de color según tenga el foco o no
   dibujarVolver();
+  avisarVozMarcada();    // volvió del botón de volver a la lista: el cursor llega a una voz
 }
 
 // Suma o resta al índice sin salirse de la lista, desplazándola si hace falta.
@@ -561,6 +580,7 @@ void moverIndice(int paso) {
     dibujarFila(anterior);   // solo cambió la marca: alcanza con las dos filas involucradas
     dibujarFila(indice);
   }
+  avisarVozMarcada();   // el cursor pasó a otra voz
 }
 
 // =====================================================================
@@ -826,7 +846,10 @@ int posicionPista(int canal) {
 void quitarPista(int canal) {
   int i = posicionPista(canal);
   if (cantidadPistas == 0 || pistas[i] != canal) return;
-  for (; i < cantidadPistas - 1; i++) pistas[i] = pistas[i + 1];
+  for (; i < cantidadPistas - 1; i++) {
+    pistas[i] = pistas[i + 1];
+    nombresPistas[i] = nombresPistas[i + 1];
+  }
   cantidadPistas--;
 }
 
@@ -1098,13 +1121,17 @@ void separarProyectos(String resto) {
   }
 }
 
-// PISTAS:0,1,2 (canales de las pistas del proyecto)
+// PISTAS:0=Melodia,3=Melodia 2,2=Sugerencia IA (canal y nombre de cada pista del proyecto)
 void separarPistas(String resto) {
   cantidadPistas = 0;
   while (resto.length() > 0 && cantidadPistas < MAX_PISTAS) {
     int coma = resto.indexOf(',');
     if (coma == -1) coma = resto.length();
-    pistas[cantidadPistas++] = resto.substring(0, coma).toInt();
+    String parte = resto.substring(0, coma);   // "3=Melodia 2"
+    int igual = parte.indexOf('=');
+    pistas[cantidadPistas] = parte.toInt();    // toInt() lee solo el número del principio
+    nombresPistas[cantidadPistas] = (igual == -1) ? String("") : parte.substring(igual + 1);
+    cantidadPistas++;
     resto = resto.substring(min(coma + 1, (int)resto.length()));
   }
 }
@@ -1217,7 +1244,10 @@ void setup() {
   // Teclado
   pinMode(pinPL, OUTPUT);
   pinMode(pinCLK, OUTPUT);
-  pinMode(pinData, INPUT);
+  // Con pull-up: si el teclado no está conectado, el pin lee siempre 1 (= ninguna tecla
+  // apretada) en vez de quedar al aire y mandar notas falsas. Con los 74HC165 conectados
+  // no cambia nada, porque el chip maneja el pin.
+  pinMode(pinData, INPUT_PULLUP);
   digitalWrite(pinPL, HIGH);
   digitalWrite(pinCLK, LOW);
   // Parte del estado real para no mandar notas falsas al arrancar:
@@ -1248,6 +1278,6 @@ void loop() {
   actualizarTeclado();
   actualizarJoystick();
   actualizarBotones();
-  leerPotenciometro();
+  if (HAY_POTENCIOMETRO) leerPotenciometro();
   leerDesdePython();
 }

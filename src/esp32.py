@@ -83,8 +83,7 @@ def _es_numero(texto):
 
 
 def _escuchar():
-    """Corre en segundo plano: lee cada línea del ESP32 y la manda a donde corresponde."""
-    global instrumento_microfono, instrumento_teclado
+    """Corre en segundo plano: lee cada línea del ESP32 y se la pasa a _repartir()."""
     while True:
         try:
             linea = _conexion.readline().decode("utf-8", errors="ignore").strip()
@@ -93,66 +92,83 @@ def _escuchar():
             return
         if not linea:
             continue
-        partes = linea.split(":")
+        print(f"[ESP32 ->] {linea}")   # cada señal que llega, tal cual
+        try:
+            _repartir(linea)
+        except Exception as e:
+            # Si algo falla al atender una línea, se avisa y se sigue leyendo. Sin esto, un
+            # error cualquiera terminaba este hilo y Python no recibía nada más del ESP32.
+            print(f"[ESP32 ->] Error al atender {linea!r}: {type(e).__name__}: {e}")
 
-        # ----- Teclas: ON:tecla:velocity / OFF:tecla -----
-        if partes[0] == "ON" and len(partes) == 3 and partes[1].isdigit() and partes[2].isdigit():
-            velocidad = max(1, min(127, int(partes[2])))
-            _teclas.put(("on", tecla_a_nota(int(partes[1])), velocidad))
-        elif partes[0] == "OFF" and len(partes) == 2 and partes[1].isdigit():
-            _teclas.put(("off", tecla_a_nota(int(partes[1])), 0))
 
-        # ----- Botones de grabación: G:M1 / G:C0 / G:T1 ... -----
-        elif linea in _BOTONES:
-            _pedidos.put(("BOTON",) + _BOTONES[linea])
+def _repartir(linea):
+    """Manda una línea del ESP32 a donde corresponde (la llama _escuchar por cada línea)."""
+    global instrumento_microfono, instrumento_teclado
+    partes = linea.split(":")
 
-        # ----- Instrumentos: SEL:MIC:n / SEL:TEC:n -----
-        elif partes[0] == "SEL" and len(partes) == 3 and partes[2].isdigit():
-            if partes[1] == "MIC":
-                instrumento_microfono = int(partes[2])
-            elif partes[1] == "TEC":
-                instrumento_teclado = int(partes[2])
-                reproducir.elegir_instrumento(instrumento_teclado)   # cambia en vivo
+    # ----- Teclas: ON:tecla:velocity / OFF:tecla -----
+    if partes[0] == "ON" and len(partes) == 3 and partes[1].isdigit() and partes[2].isdigit():
+        velocidad = max(1, min(127, int(partes[2])))
+        _teclas.put(("on", tecla_a_nota(int(partes[1])), velocidad))
+    elif partes[0] == "OFF" and len(partes) == 2 and partes[1].isdigit():
+        _teclas.put(("off", tecla_a_nota(int(partes[1])), 0))
 
-        # ----- Perilla: POT:VOL:90 (todo el proyecto) o POT:REV:90:2 (solo la pista del canal 2) -----
-        elif partes[0] == "POT" and len(partes) in (3, 4) and all(p.isdigit() for p in partes[2:]):
-            canal = int(partes[3]) if len(partes) == 4 else None
-            reproducir.aplicar_perilla(partes[1], int(partes[2]), canal)
+    # ----- Botones de grabación: G:M1 / G:C0 / G:T1 ... -----
+    elif linea in _BOTONES:
+        _pedidos.put(("BOTON",) + _BOTONES[linea])
 
-        # ----- Voz de la IA: VOZ:n -----
-        elif partes[0] == "VOZ" and len(partes) == 2 and partes[1].isdigit():
-            gem.voz_actual = int(partes[1])
-            _pedidos.put(("VOZ", int(partes[1])))   # main.py la guarda en config.json
+    # ----- Instrumentos: SEL:MIC:n / SEL:TEC:n -----
+    elif partes[0] == "SEL" and len(partes) == 3 and partes[2].isdigit():
+        if partes[1] == "MIC":
+            instrumento_microfono = int(partes[2])
+        elif partes[1] == "TEC":
+            instrumento_teclado = int(partes[2])
+            reproducir.elegir_instrumento(instrumento_teclado)   # cambia en vivo
 
-        # ----- Proyectos -----
-        elif linea == "PROY:PEDIR":
-            enviar("LISTA:" + ",".join(proyectos.listar()))
-        elif linea == "PROY:NUEVO":
-            _pedidos.put(("NUEVO",))
-        elif linea.startswith("PROY:ABRIR:") and linea[11:].isdigit():
-            _pedidos.put(("ABRIR", int(linea[11:])))
-        elif linea.startswith("PROY:RENOMBRAR:") and linea[15:].isdigit():
-            _pedidos.put(("RENOMBRAR", int(linea[15:])))
-        elif linea == "PROY:PLAY":
-            _pedidos.put(("PLAY",))
-        elif linea == "PROY:CERRAR":
-            _pedidos.put(("CERRAR",))
+    # ----- Perilla: POT:VOL:90 (todo el proyecto) o POT:REV:90:2 (solo la pista del canal 2) -----
+    elif partes[0] == "POT" and len(partes) in (3, 4) and all(p.isdigit() for p in partes[2:]):
+        canal = int(partes[3]) if len(partes) == 4 else None
+        reproducir.aplicar_perilla(partes[1], int(partes[2]), canal)
 
-        # ----- Respuestas Sí / No -----
-        elif linea in _SI_NO:
-            _pedidos.put(("SI_NO", _SI_NO[linea]))
-        elif linea in _CONFIRMACION:
-            _pedidos.put(("CONFIRMACION", _CONFIRMACION[linea]))
+    # ----- Voz de la IA: VOZ:n -----
+    elif partes[0] == "VOZ" and len(partes) == 2 and partes[1].isdigit():
+        gem.voz_actual = int(partes[1])
+        _pedidos.put(("VOZ", int(partes[1])))   # main.py la guarda en config.json
 
-        # ----- Pistas: MOVER:canal:tiempos / PISTA:canal:accion[:valor] -----
-        elif partes[0] == "MOVER" and len(partes) == 3 and partes[1].isdigit() and _es_numero(partes[2]):
-            _pedidos.put(("MOVER", int(partes[1]), int(partes[2])))
-        elif partes[0] == "PISTA" and len(partes) in (3, 4) and partes[1].isdigit():
-            valor = int(partes[3]) if len(partes) == 4 and partes[3].isdigit() else None
-            _pedidos.put(("PISTA", int(partes[1]), partes[2], valor))
+    # ----- Cursor sobre una voz: MARCA:VOZ:n (suena su muestra para escucharla) -----
+    # Se atiende acá mismo y sin esperar: si el cursor pasa a otra voz, corta la anterior.
+    elif partes[0] == "MARCA" and len(partes) == 3 and partes[1] == "VOZ" and partes[2].isdigit():
+        gem.muestra_voz(int(partes[2]))
 
-        else:
-            print(f"ESP32: {linea}")   # mensajes de depuración del ESP32
+    # ----- Proyectos -----
+    elif linea == "PROY:PEDIR":
+        enviar("LISTA:" + ",".join(proyectos.listar()))
+    elif linea == "PROY:NUEVO":
+        _pedidos.put(("NUEVO",))
+    elif linea.startswith("PROY:ABRIR:") and linea[11:].isdigit():
+        _pedidos.put(("ABRIR", int(linea[11:])))
+    elif linea.startswith("PROY:RENOMBRAR:") and linea[15:].isdigit():
+        _pedidos.put(("RENOMBRAR", int(linea[15:])))
+    elif linea == "PROY:PLAY":
+        _pedidos.put(("PLAY",))
+    elif linea == "PROY:CERRAR":
+        _pedidos.put(("CERRAR",))
+
+    # ----- Respuestas Sí / No -----
+    elif linea in _SI_NO:
+        _pedidos.put(("SI_NO", _SI_NO[linea]))
+    elif linea in _CONFIRMACION:
+        _pedidos.put(("CONFIRMACION", _CONFIRMACION[linea]))
+
+    # ----- Pistas: MOVER:canal:tiempos / PISTA:canal:accion[:valor] -----
+    elif partes[0] == "MOVER" and len(partes) == 3 and partes[1].isdigit() and _es_numero(partes[2]):
+        _pedidos.put(("MOVER", int(partes[1]), int(partes[2])))
+    elif partes[0] == "PISTA" and len(partes) in (3, 4) and partes[1].isdigit():
+        valor = int(partes[3]) if len(partes) == 4 and partes[3].isdigit() else None
+        _pedidos.put(("PISTA", int(partes[1]), partes[2], valor))
+
+    else:
+        print(f"[ESP32 ->] (no reconocida, se ignora) {linea}")   # mensajes de depuración del ESP32
 
 
 # ---------- Pedidos para main.py ----------

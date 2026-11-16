@@ -68,17 +68,27 @@ def _sonar(msg):
         fs.cc(msg.channel, msg.control, msg.value)
 
 
+def _mensajes(proyecto):
+    """Mensajes del proyecto en orden y con su espera, listos para sonar.
+    La primera vez que se reproduce un archivo, mido mezcla todas las pistas en una sola
+    y se guarda esa mezcla (un caché) para no volver a armarla. El problema es que el
+    proyecto cambia después de eso: si no se borra la mezcla guardada, sigue sonando la
+    vieja y no se escuchan las pistas nuevas, los cambios de instrumento ni los movimientos."""
+    del proyecto.merged_track   # borra la mezcla guardada: play() la arma de nuevo
+    return proyecto.play()
+
+
 def reproducir_proyecto(proyecto):
     """Reproduce todas las pistas juntas, cada una con su instrumento. La función play()
     de mido mezcla las pistas en una sola línea de tiempo y espera entre mensaje y mensaje
     lo que corresponde."""
-    for msg in proyecto.play():
+    for msg in _mensajes(proyecto):
         _sonar(msg)
 
 
 def reproducir_pista(proyecto, canal):
     """Reproduce una sola pista del proyecto (la del canal indicado)."""
-    for msg in proyecto.play():
+    for msg in _mensajes(proyecto):
         if not msg.is_meta and msg.channel == canal:
             _sonar(msg)
 

@@ -16,12 +16,18 @@ CARPETA = "proyectos"
 TICKS_POR_TIEMPO = 480   # resolución de tiempo (ticks_per_beat) de todos los proyectos
 BPM = 120                # pulso con el que se graba el teclado
 
-# Nombre de cada pista según su canal MIDI (ver Multipista con FluidSynth)
+# Cada pista usa su propio canal MIDI, y ese canal es lo que la identifica (ver Multipista
+# con FluidSynth). La primera melodía va al canal 0, el primer teclado al 1 y la sugerencia
+# de la IA al 2. Las grabaciones siguientes usan los canales que queden libres.
 NOMBRES = {0: "Melodia", 1: "Teclado", 2: "Sugerencia IA"}
+CANALES_EXTRA = [3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]   # el 9 no: en General MIDI es la batería
 
 
-def nombre_pista(canal):
-    return NOMBRES.get(canal, f"Pista {canal}")
+def nombre_pista(pista):
+    """Nombre de una pista: el que tiene guardado adentro (track_name) o, si no tiene,
+    el que le corresponde por su canal."""
+    canal = canal_de_pista(pista)
+    return pista.name or NOMBRES.get(canal, f"Pista {canal}")
 
 
 # =====================================================================
@@ -75,6 +81,37 @@ def canales(proyecto):
     return [c for p in proyecto.tracks if (c := canal_de_pista(p)) is not None]
 
 
+def nombres(proyecto):
+    """Pares (canal, nombre) de las pistas del proyecto, en el orden en que están guardadas."""
+    return [(c, nombre_pista(p)) for p in proyecto.tracks if (c := canal_de_pista(p)) is not None]
+
+
+def nombre_de(proyecto, canal):
+    """Nombre de la pista de ese canal."""
+    return dict(nombres(proyecto)).get(canal, NOMBRES.get(canal, f"Pista {canal}"))
+
+
+def canal_libre(proyecto, preferido):
+    """Canal para una pista nueva: el preferido si nadie lo usa (0 para la melodía, 1 para
+    el teclado) y, si ya está ocupado, el primero libre de los demás. Así cada grabación
+    queda en su propia pista en vez de pisar a la anterior. Devuelve None si no queda ninguno."""
+    usados = canales(proyecto)
+    for canal in [preferido] + CANALES_EXTRA:
+        if canal not in usados:
+            return canal
+    return None
+
+
+def nombre_libre(proyecto, base):
+    """Nombre para una pista nueva: "Melodia", y si ya existe "Melodia 2", "Melodia 3"..."""
+    usados = [nombre for _, nombre in nombres(proyecto)]
+    nombre, numero = base, 1
+    while nombre in usados:
+        numero += 1
+        nombre = f"{base} {numero}"
+    return nombre
+
+
 def poner_pista(proyecto, pista):
     """Agrega la pista al proyecto. Si ya había una en ese canal, la reemplaza."""
     borrar_pista(proyecto, canal_de_pista(pista))
@@ -115,20 +152,20 @@ def mover_pista(proyecto, canal, tiempos):
 #  Convertir a pista (la melodía de Basic Pitch y lo grabado en el teclado)
 # =====================================================================
 
-def _encabezado(canal, instrumento):
+def _encabezado(nombre, canal, instrumento):
     """Toda pista empieza con su nombre (track_name) y su instrumento (program_change)."""
     pista = mido.MidiTrack()
-    pista.append(mido.MetaMessage("track_name", name=nombre_pista(canal)))
+    pista.append(mido.MetaMessage("track_name", name=nombre))
     pista.append(mido.Message("program_change", channel=canal, program=instrumento, time=0))
     return pista
 
 
-def midi_a_pista(archivo, canal, instrumento, ticks_destino):
+def midi_a_pista(archivo, nombre, canal, instrumento, ticks_destino):
     """Convierte un archivo MIDI (la melodía que generó Basic Pitch) en una pista del
-    proyecto, en el canal indicado y con los ticks_per_beat del proyecto."""
+    proyecto, con ese nombre, en el canal indicado y con los ticks_per_beat del proyecto."""
     origen = mido.MidiFile(archivo)
     factor = ticks_destino / origen.ticks_per_beat   # cambio de resolución de tiempo
-    pista = _encabezado(canal, instrumento)
+    pista = _encabezado(nombre, canal, instrumento)
 
     acumulado = 0.0   # tiempo absoluto en ticks del proyecto (los deltas se suman escalados)
     anterior = 0
@@ -141,10 +178,10 @@ def midi_a_pista(archivo, canal, instrumento, ticks_destino):
     return pista
 
 
-def teclado_a_pista(eventos, canal, instrumento, ticks_destino):
+def teclado_a_pista(eventos, nombre, canal, instrumento, ticks_destino):
     """Convierte lo tocado en el teclado en una pista. Cada evento es
     (segundos desde que empezó la grabación, "on" / "off", nota, velocity)."""
-    pista = _encabezado(canal, instrumento)
+    pista = _encabezado(nombre, canal, instrumento)
     anterior = 0
     for segundos, tipo, nota, velocidad in eventos:
         ahora = round(segundos * (BPM / 60) * ticks_destino)   # segundos -> tiempos -> ticks
@@ -168,7 +205,7 @@ def sin_tildes(texto):
 def limpiar_nombre(texto):
     """Convierte un nombre en un nombre de archivo válido:
     "Canción del mar" se guarda como cancion_del_mar.mid."""
-    texto = re.sub(r"[^a-zA-Z0-9 ]", "", sin_tildes(texto)).strip().lower()
+    texto = re.sub(r"[^a-zA-Z0-9 _-]", "", sin_tildes(texto)).strip().lower()   # deja _ y - escritos
     return texto.replace(" ", "_")[:30]
 
 

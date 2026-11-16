@@ -1,13 +1,19 @@
 import asyncio
+import io
 import json
 import os
 import re
+import shutil
 import time
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-import whisper
+from pydantic import BaseModel
+from groq import Groq
+import numpy as np
+import scipy.io.wavfile as wavfile
+from scipy.signal import resample_poly
 import edge_tts
 from gtts import gTTS
 import pygame
@@ -17,17 +23,72 @@ import reproducir
 
 load_dotenv()
 
-MODELO = "gemini-2.5-flash"
+MODELO = "gemini-3.5-flash"
 
 # =====================================================================
-#  Transcripción de voz a texto (Whisper)
+#  Transcripción de voz a texto (Whisper en Groq)
 # =====================================================================
-# Tamaños de modelo: tiny, base, small, medium, large, turbo
-model = whisper.load_model("base")
+# Whisper corre en los servidores de Groq: tarda alrededor de 1 s y usa el modelo grande,
+# que se equivoca menos. En la computadora, sin placa de video, el modelo "base" tardaba
+# unos 9 s por mensaje. Si Groq falla, se usa Whisper en la computadora como respaldo.
+_clave_groq = os.getenv("GROQ_API_KEY")
+cliente_groq = Groq(api_key=_clave_groq) if _clave_groq else None
+_whisper_local = None   # se carga solo si hace falta el respaldo (tarda unos 30 s)
+
+# Con una grabación en silencio, Whisper a veces inventa una frase ("Gracias.").
+# Si el sonido más fuerte no llega a este nivel (1 = el máximo), no se transcribe.
+NIVEL_SILENCIO = 0.01
+# Frases que Whisper inventa cuando escucha tarareo o ruido en vez de palabras
+# (aprendió de videos subtitulados que terminan así). Si aparecen, se descarta el texto.
+FRASES_INVENTADAS = re.compile(r"suscr[ií]bete|gracias por ver|amara\.org|subt[ií]tulos", re.IGNORECASE)
+
+
+def _leer_audio(archivo):
+    """Lee la grabación y la deja en mono, con valores entre -1 y 1."""
+    frecuencia, datos = wavfile.read(archivo)
+    datos = datos.astype(np.float32)
+    if datos.ndim > 1:
+        datos = datos.mean(axis=1)          # estéreo -> mono
+    if np.abs(datos).max() > 1.0:
+        datos /= 32768                      # venía en enteros de 16 bits
+    return frecuencia, datos
+
+
+def _audio_para_enviar(frecuencia, datos):
+    """Pasa el audio a 16 kHz y 16 bits, que es lo que usa Whisper por dentro.
+    El archivo queda unas 5 veces más chico y sube más rápido."""
+    datos = resample_poly(datos, 16000, frecuencia)
+    salida = io.BytesIO()
+    wavfile.write(salida, 16000, (np.clip(datos, -1, 1) * 32767).astype(np.int16))
+    return salida.getvalue()
 
 
 def transcribir(archivo):
-    return model.transcribe(archivo, language="es")["text"].strip()
+    frecuencia, datos = _leer_audio(archivo)
+    if datos.size == 0 or np.abs(datos).max() < NIVEL_SILENCIO:
+        return ""   # solo silencio: responder() lo toma como "no se entendió nada"
+    texto = _transcribir_audio(archivo, frecuencia, datos)
+    return "" if FRASES_INVENTADAS.search(texto) else texto
+
+
+def _transcribir_audio(archivo, frecuencia, datos):
+    if cliente_groq is not None:
+        try:
+            resultado = cliente_groq.audio.transcriptions.create(
+                file=("grabacion.wav", _audio_para_enviar(frecuencia, datos)),
+                model="whisper-large-v3-turbo",
+                language="es",
+                temperature=0,
+            )
+            return resultado.text.strip()
+        except Exception as e:
+            print(f"Groq no respondió ({e}). Se usa Whisper en la computadora (más lento).")
+
+    global _whisper_local
+    if _whisper_local is None:
+        import whisper   # se importa recién acá: cargarlo demora el arranque del programa
+        _whisper_local = whisper.load_model("base")
+    return _whisper_local.transcribe(archivo, language="es")["text"].strip()
 
 
 # =====================================================================
@@ -78,10 +139,10 @@ def hablar_con_mi_gem(mensaje):
 # =====================================================================
 # ID de las 4 voces elegidas en la biblioteca de ElevenLabs
 VOCES = {
-    0: "ID_VOZ_1",
-    1: "ID_VOZ_2",
-    2: "ID_VOZ_3",
-    3: "ID_VOZ_4",
+    0: "nbcvT3C2tyOd2OsRAtUf", #Maya
+    1: "htFfPSZGJwjBv1CL0aMD", #Antonio
+    2: "nTkjq09AuYgsNR8E4sDe", #Sol
+    3: "tomkxGQGz4b1kE0EM722", #Mario
 }
 # Voces de edge-tts parecidas, por si ElevenLabs no responde
 VOCES_EDGE = {
@@ -153,6 +214,7 @@ def texto_a_voz(texto, expresar=True):
             for parte in audio:  # el audio llega en partes y se van escribiendo
                 f.write(parte)
         return "respuesta_ia.mp3"
+
     except Exception as e:
         print(f"ElevenLabs no respondió ({e}). Se usa edge-tts.")
         asyncio.run(voz_edge(sin_etiquetas(texto)))  # edge-tts recibe el texto sin etiquetas
@@ -175,6 +237,41 @@ def leer(texto, expresar=True):
     """Dice en voz alta un texto (una respuesta de la IA o una frase fija)."""
     print(f"IA: {texto}")
     reproducir_audio(texto_a_voz(texto, expresar))
+
+
+# ---------- Audios ya grabados ----------
+CARPETA_AUDIOS = os.path.join("assets", "audios")
+
+
+def muestra_voz(voz):
+    """Reproduce la muestra de una voz (assets/audios/muestra_voz_N.mp3) cuando el cursor
+    llega a ella en "Elegir voz de la IA". No espera a que termine: la llama el hilo que lee
+    el puerto, que no se puede quedar trabado. Si ya sonaba otra muestra, la corta."""
+    archivo = os.path.join(CARPETA_AUDIOS, f"muestra_voz_{voz}.mp3")
+    if not os.path.exists(archivo):
+        print(f"Falta la muestra {archivo}")
+        return
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
+    pygame.mixer.music.load(archivo)   # cargar otro archivo corta el que estaba sonando
+    pygame.mixer.music.set_volume(reproducir.volumen_general / 127)
+    pygame.mixer.music.play()
+
+
+def decir_frase(clave, texto):
+    """Frases fijas, que siempre dicen lo mismo (como la bienvenida). Se usa el audio ya
+    grabado de la voz actual, assets/audios/<clave>_N.mp3. Si todavía no existe, se crea
+    una sola vez con ElevenLabs y se guarda ahí: las próximas veces ya no se gasta nada."""
+    archivo = os.path.join(CARPETA_AUDIOS, f"{clave}_{voz_actual}.mp3")
+    print(f"IA: {sin_etiquetas(texto)}")
+    if not os.path.exists(archivo):
+        generado = texto_a_voz(texto, expresar=False)
+        if generado != "respuesta_ia.mp3":
+            reproducir_audio(generado)   # salió de edge-tts (respaldo): no se guarda
+            return
+        os.makedirs(CARPETA_AUDIOS, exist_ok=True)
+        shutil.copyfile(generado, archivo)
+    reproducir_audio(archivo)
 
 
 # =====================================================================
@@ -234,11 +331,23 @@ def acepto_sugerencia(propuesta, mensaje):
 
 
 # ---------- Sugerencia en formato JSON ----------
+# Forma exacta que tiene que tener el JSON. Con response_schema, Gemini está obligado
+# a responder con estas claves y estos tipos (sin esto a veces inventa otra estructura).
+class Acorde(BaseModel):
+    cifrado: str   # cifrado americano, por ejemplo "Am" o "Cmaj7"
+    tiempos: int   # cuántos tiempos dura
+
+
+class Sugerencia(BaseModel):
+    instrumento: int        # número 0-127 de General MIDI
+    acordes: list[Acorde]
+
+
 def pedir_sugerencia_json(idea_aceptada, melodia_txt, tonalidad):
     pedido = (
-        "Convertí esta sugerencia en datos. Respondé solo con JSON con las claves "
-        "instrumento (número 0-127 de General MIDI) y acordes "
-        "(lista de objetos con cifrado y tiempos).\n"
+        "Convertí esta sugerencia en datos: el instrumento (número 0-127 de General MIDI) "
+        "y la lista de acordes, cada uno con su cifrado americano (por ejemplo Am, F, Cmaj7) "
+        "y cuántos tiempos dura (un número entero, por ejemplo 4).\n"
         f"Sugerencia aceptada: {idea_aceptada}\n"
         f"Tonalidad de la melodía: {tonalidad}\n"
         f"Melodía: {melodia_txt}"
@@ -248,6 +357,7 @@ def pedir_sugerencia_json(idea_aceptada, melodia_txt, tonalidad):
         contents=pedido,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",  # obliga a responder en JSON
+            response_schema=Sugerencia,             # ...y con esta forma exacta
             temperature=0.3,
         ),
     )

@@ -7,7 +7,14 @@ def detectar_tonalidad(archivo):
     algoritmos de teoría musical real. Devuelve la tonalidad (por ejemplo, C major).
     Detecta escalas mayores y menores; si se quieren escalas más exóticas, music21
     las tiene, pero hay que compararlas una por una con las notas."""
+    
     return converter.parse(archivo).analyze("key")
+
+
+def texto_tonalidad(tonalidad):
+    """Escribe la tonalidad para mandársela a Gemini. music21 escribe los bemoles con "-"
+    ("E- major" es Mi bemol mayor) y Gemini lo leía como Mi mayor: se cambia por "b" ("Eb major")."""
+    return f"{tonalidad.tonic.name.replace('-', 'b')} {tonalidad.mode}"
 
 
 def _afinar(nota, escala):
