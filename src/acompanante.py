@@ -15,6 +15,7 @@ import mido
 import numpy as np
 
 MODELO = "expressive_medium"   # el que mejor sonó en las pruebas (hay también yellow y prism)
+MODELOS = ("expressive_medium", "prism_medium")   # los que se pueden elegir en el panel web
 COMPASES_MINIMOS = 4           # el modelo trabaja con ventanas de 4 compases o más
 CANAL_BATERIA = 9              # en General MIDI el canal 9 es la batería: no se usa para las pistas
 INTENTOS = 3                   # veces que se le pide la pista al modelo si sale pobre
@@ -28,16 +29,24 @@ ESPACIOS = {"poco": 1, "medio": 4, "mucho": 7}
 # Nota alrededor de la cual queda la pista (48 = Do de la octava 3, 60 = Do central).
 REGISTROS = {"grave": 40, "medio": 55, "agudo": 70}
 
-_motor = None   # el modelo se carga la primera vez que se pide una sugerencia (tarda unos segundos)
+_motor = None          # el modelo se carga la primera vez que se pide una sugerencia (tarda unos segundos)
+_modelo_cargado = None
 
 
-def motor():
+def motor(modelo=None):
     """Devuelve el modelo ya cargado. La primera vez lo carga (y si nunca se usó en esta
-    computadora, lo descarga: hace falta haber iniciado sesión en Hugging Face)."""
-    global _motor
-    if _motor is None:
+    computadora, lo descarga: hace falta haber iniciado sesión en Hugging Face).
+    Se tiene uno solo en memoria por vez (cada uno ocupa unos cientos de MB): si se pide otro,
+    se suelta el anterior."""
+    global _motor, _modelo_cargado
+    modelo = modelo or MODELO
+    if modelo not in MODELOS:
+        raise ValueError(f"Modelo de MIDI-GPT desconocido: {modelo}")
+    if _motor is None or _modelo_cargado != modelo:
         from midigpt.inference.engine import InferenceEngine   # importarlo tarda: recién acá
-        _motor = InferenceEngine.from_pretrained(MODELO, device="cpu")
+        _motor = None   # suelta el anterior antes de cargar el nuevo
+        _motor = InferenceEngine.from_pretrained(modelo, device="cpu")
+        _modelo_cargado = modelo
     return _motor
 
 
@@ -128,7 +137,7 @@ def _pista_en_partitura(pista, canal, reales, partitura):
 #  Pedido a MIDI-GPT
 # =====================================================================
 
-def _controles(datos):
+def _controles(datos, modelo=None):
     """Pasa lo que eligió Gemini a los controles del modelo. Devuelve (de_pista, de_compas):
     unos valen para toda la pista y otros se repiten en cada compás. Los nombres cambian
     según el modelo ("max_polyphony" o "bar_max_polyphony"), por eso se le preguntan a él."""
@@ -142,7 +151,7 @@ def _controles(datos):
         "max_note_duration": larga,
         "silence_proportion": ESPACIOS.get(datos.get("espacio"), ESPACIOS["medio"]),
     }
-    niveles = motor()._analyzer.attribute_levels()   # control -> "track" (pista) o "bar" (compás)
+    niveles = motor(modelo)._analyzer.attribute_levels()   # control -> "track" (pista) o "bar" (compás)
     de_pista, de_compas = {}, {}
     for nombre, valor in pedidos.items():
         for candidato in (nombre, "bar_" + nombre):
@@ -166,13 +175,14 @@ def _al_registro(notas, registro):
     return [(inicio, fin, nota + 12 * octavas, velocity) for inicio, fin, nota, velocity in notas]
 
 
-def generar(pistas, ticks_por_tiempo, onsets, pulso, datos):
+def generar(pistas, ticks_por_tiempo, onsets, pulso, datos, modelo=None):
     """Genera una pista nueva que acompaña a las pistas dadas.
 
     pistas  : pistas del proyecto que el modelo tiene que escuchar (las de mido)
     onsets  : inicios de las notas de la melodía, en ticks (marcan el pulso del usuario)
     pulso   : cuánto dura un pulso de esa melodía, en ticks
     datos   : lo que eligió Gemini: instrumento, voces, notas, espacio y registro
+    modelo  : "expressive_medium" (el predeterminado) o "prism_medium"
 
     Devuelve las notas nuevas como (inicio, fin, nota, velocity), en ticks del proyecto."""
     from midigpt import Bar, Score, Track   # se importa acá: cargarlo demora el arranque
@@ -206,7 +216,7 @@ def generar(pistas, ticks_por_tiempo, onsets, pulso, datos):
 
         # 3) El pedido: las pistas que ya estaban quedan como contexto (bars=[] = no tocarlas)
         #    y la nueva se genera entera, compás por compás (autoregressive).
-        de_pista, de_compas = _controles(datos)
+        de_pista, de_compas = _controles(datos, modelo)
         pedido = GenerationRequest(
             tracks=[TrackPrompt(id=i, bars=[]) for i in range(cantidad)] + [TrackPrompt(
                 id=cantidad, bars=list(range(compases)), autoregressive=True, attributes=de_pista,
@@ -219,7 +229,7 @@ def generar(pistas, ticks_por_tiempo, onsets, pulso, datos):
         final = max(fin for pista in pistas for _, fin, _, _ in notas_de_pista(pista))
         mejor = []
         for _ in range(INTENTOS):
-            motor().session(copy.deepcopy(musica), pedido).run().to_midi(salida)
+            motor(modelo).session(copy.deepcopy(musica), pedido).run().to_midi(salida)
             generado = mido.MidiFile(salida)
             notas = _a_tiempo_real(generado.tracks[cantidad], ticks_por_tiempo / generado.ticks_per_beat,
                                    reales, partitura, final, pulso)

@@ -182,8 +182,14 @@ function usarArreglo(a) {
   $('bassBalance').value = a.balance_bajo;
   $('responseBalance').value = a.balance_respuesta;
   extraBrief = {...extraBrief, notas: a.notas, espacio: a.espacio};   // no tienen control en el panel
+  // Los mismos datos, en los controles de MIDI-GPT (por si esa es la opción marcada)
+  elegir('mgInstrumento', a.instrumento);
+  $('mgVoces').value = String(Math.max(1, Math.min(4, a.voces)));
+  $('mgNotas').value = a.notas;
+  $('mgEspacio').value = a.espacio;
+  $('mgRegistro').value = a.registro;
   sync();
-  const tipo = mode() === 'song' ? 'la composición más larga' : 'el ensamble';
+  const tipo = {song: 'la composición más larga', midigpt: 'la pista con MIDI-GPT'}[mode()] || 'el ensamble';
   burbuja(`(Ajustes elegidos por la IA cargados en el panel. Generando ${tipo}…)`, 'ia muted');
   $('generate').click();
 }
