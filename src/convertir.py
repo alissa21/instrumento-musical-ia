@@ -13,6 +13,14 @@ def conversion(input_audio):
     if not os.path.exists(input_audio):
         raise FileNotFoundError(f"No se encontró el archivo de audio: {input_audio}")
 
+    # Basic Pitch guarda primero con un nombre fijo y después se le pone el número (paso 3).
+    # Si una conversión anterior se cortó a la mitad, ese archivo quedó y Basic Pitch se niega a
+    # sobrescribirlo: todas las conversiones siguientes fallaban. Se borra antes de empezar.
+    nombre_base_audio = os.path.splitext(os.path.basename(input_audio))[0]
+    sobrante = os.path.join(output_dir, f"{nombre_base_audio}_basic_pitch.mid")
+    if os.path.exists(sobrante):
+        os.remove(sobrante)
+
 # Llamada correcta con todos los argumentos requeridos
     predict_and_save(
     audio_path_list=[input_audio],      # Lista con las rutas de audio

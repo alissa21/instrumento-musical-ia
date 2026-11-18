@@ -3,7 +3,8 @@ import os
 import threading
 import time
 
-import grabar, convertir, correccion, gem, reproducir, esp32, proyectos, sugerencia
+import grabar, convertir, correccion, reproducir, esp32, proyectos, sugerencia
+from asistente import gem   # Gemini o ChatGPT, según IA_CHAT en el .env
 
 CONFIG = "config.json"
 
@@ -143,6 +144,9 @@ def atender(pedido, config):
 
 
 def abrir_pantalla_principal():
+    global ultima_propuesta
+    gem.reiniciar_contexto_musical()   # otro proyecto: la IA empieza la charla de cero
+    ultima_propuesta = ""
     enviar_pistas()
     esp32.enviar(f"PANTALLA:PRINCIPAL:{nombre}")
 
@@ -204,6 +208,10 @@ def procesar_melodia():
     archivo_midi = convertir.conversion("grabacion_melodia.wav")   # Basic Pitch
     tonalidad = correccion.detectar_tonalidad(archivo_midi)        # music21
     correccion.corregir(archivo_midi, tonalidad)                   # afina las notas dentro de la escala
+    ritmo = correccion.cuantizar(archivo_midi)                     # tiempos -> negras, corcheas...
+    if ritmo:
+        print(f"Cuantización: pulso de {ritmo['bpm']} BPM, notas movidas en promedio "
+              f"{ritmo['movimiento_medio_ms']} ms (máximo {ritmo['movimiento_maximo_ms']} ms)")
 
     # La pista se crea con el instrumento elegido en ese momento para el micrófono.
     pista = proyectos.midi_a_pista(archivo_midi, proyectos.nombre_libre(proyecto, "Melodia"), canal,
@@ -235,30 +243,81 @@ def procesar_chat():
         ultima_propuesta = respuesta
 
 
+# Segundos que se espera la respuesta a "¿Qué querés que genere?". Si no llega (por ejemplo,
+# con un firmware viejo que no tiene esa pantalla), se agregan instrumentos.
+ESPERA_TIPO_SUGERENCIA = 120
+
+
+def elegir_tipo_sugerencia():
+    """Pregunta en voz alta y en la pantalla si se agregan instrumentos que acompañen la
+    melodía o si se desarrolla en una composición larga. Devuelve "ensamble" o "cancion"."""
+    esp32.enviar("PANTALLA:TIPO_SUGERENCIA")   # dos opciones: Instrumentos / Cancion larga
+    gem.decir_frase("pregunta_tipo_sugerencia",
+                    "¿Quieres que agregue instrumentos que acompañen tu melodía, "
+                    "o que la desarrolle en una canción más larga?")
+    tipo = esp32.esperar_tipo_sugerencia(ESPERA_TIPO_SUGERENCIA)
+    if tipo is None:
+        print("No llegó la respuesta a '¿Qué querés que genere?'. Se agregan instrumentos.")
+        return "ensamble"
+    return tipo
+
+
+def pista_de_respaldo(idea, datos, melodia_txt, tonalidad, canal):
+    """Si el ensamble no se puede armar: una sola pista con MIDI-GPT y, si también falla,
+    con los acordes que dice Gemini (el método más viejo)."""
+    try:
+        return sugerencia.pista_con_midigpt(datos, proyecto, canal)
+    except Exception as e:
+        print(f"MIDI-GPT no pudo generar ({e}). Se usan los acordes de Gemini.")
+        acordes = gem.pedir_sugerencia_json(idea, melodia_txt, tonalidad)
+        return sugerencia.pista_con_acordes(acordes, proyecto, canal)
+
+
 def generar_sugerencia(idea, canal=None):
-    """Gemini elige el instrumento y el carácter de la pista, MIDI-GPT escribe las notas y
-    sugerencia.py la propone. Si MIDI-GPT falla, se usa el método anterior (Gemini dice los acordes).
-    canal = pista a la que acompaña (de ahí sale el pulso); sin canal, la última melodía grabada."""
-    if canal is None or canal == CANAL_IA:
-        canal = ultima_melodia
+    """Primero pregunta qué generar (elegir_tipo_sugerencia). Gemini elige los instrumentos y
+    el carácter, y sugerencia.py arma las pistas con reglas musicales:
+      - "ensamble": armonía, bajo y respuestas alrededor de la melodía (sugerencia.ensamble)
+      - "cancion": la melodía desarrollada en secciones, con el ensamble (sugerencia.cancion)
+    Si el ensamble falla, se arma una sola pista con MIDI-GPT (pista_de_respaldo).
+    canal = pista a la que acompaña; sin canal, la última melodía grabada."""
+    es_de_la_ia = any(sugerencia.es_sugerencia(p) and proyectos.canal_de_pista(p) == canal
+                      for p in proyecto.tracks)
+    if canal is None or canal == CANAL_IA or es_de_la_ia:
+        canal = ultima_melodia   # se acompaña a una melodía, no a otra sugerencia
+    tipo = elegir_tipo_sugerencia()
     try:
         archivo = os.path.join(proyectos.CARPETA, nombre + ".mid")
         tonalidad = correccion.texto_tonalidad(correccion.detectar_tonalidad(archivo))
         melodia_txt = correccion.midi_txt(archivo)
+        datos = gem.pedir_arreglo_json(idea, melodia_txt, tonalidad)
+        print(f"Arreglo pedido ({tipo}): {datos}")
+
+        prueba = pista = None
         try:
-            datos = gem.pedir_arreglo_json(idea, melodia_txt, tonalidad)
-            print(f"Arreglo pedido a MIDI-GPT: {datos}")
-            pista = sugerencia.pista_con_midigpt(datos, proyecto, canal)
+            armar = sugerencia.cancion if tipo == "cancion" else sugerencia.ensamble
+            prueba, informe = armar(datos, proyecto, canal)
+            for aviso in informe.get("warnings", []):
+                print(f"Aviso del generador: {aviso}")
         except Exception as e:
-            print(f"MIDI-GPT no pudo generar ({e}). Se usan los acordes de Gemini.")
-            datos = gem.pedir_sugerencia_json(idea, melodia_txt, tonalidad)
-            pista = sugerencia.pista_con_acordes(datos, proyecto, canal)
-        sugerencia.proponer_sugerencia(pista, proyecto, nombre)   # "¿Aceptar sugerencia?" Sí / No
+            if tipo == "cancion":
+                raise   # para la composición larga no hay otro método
+            print(f"El ensamble no se pudo armar ({e}). Se usa MIDI-GPT.")
+            pista = pista_de_respaldo(idea, datos, melodia_txt, tonalidad, canal)
+
+        # "¿Aceptar sugerencia?" Sí / No
+        if prueba is not None:
+            sugerencia.proponer(prueba, proyecto, nombre)
+        else:
+            sugerencia.proponer_sugerencia(pista, proyecto, nombre)
         enviar_pistas()
     except Exception as e:
-        print(f"No se pudo generar la sugerencia: {e}")
+        print(f"No se pudo generar la sugerencia ({tipo}): {e}")
         esp32.enviar("PANTALLA:PRINCIPAL")
-        gem.leer("Perdón, no pude preparar la sugerencia. Probemos de nuevo en un momento.", expresar=False)
+        if tipo == "cancion":
+            gem.leer("Perdón, no pude desarrollar la canción. Funciona con una melodía de entre "
+                     "cuatro y sesenta y cuatro notas.", expresar=False)
+        else:
+            gem.leer("Perdón, no pude preparar la sugerencia. Probemos de nuevo en un momento.", expresar=False)
 
 
 # =====================================================================

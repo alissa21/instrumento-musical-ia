@@ -6,6 +6,7 @@ MIDI-GPT escribe las notas, mirando las pistas que ya tiene el proyecto.
 
 Este archivo no importa nada del resto del programa (ni el ESP32 ni el sintetizador), así
 se puede probar solo con un archivo MIDI."""
+import copy
 import os
 import statistics
 import tempfile
@@ -16,6 +17,8 @@ import numpy as np
 MODELO = "expressive_medium"   # el que mejor sonó en las pruebas (hay también yellow y prism)
 COMPASES_MINIMOS = 4           # el modelo trabaja con ventanas de 4 compases o más
 CANAL_BATERIA = 9              # en General MIDI el canal 9 es la batería: no se usa para las pistas
+INTENTOS = 3                   # veces que se le pide la pista al modelo si sale pobre
+ALTURAS_MINIMAS = 3            # con menos notas distintas que esto, la pista se considera pobre
 
 # Lo que elige Gemini -> niveles de los controles de MIDI-GPT.
 # Duración de las notas: 0 fusa, 1 semicorchea, 2 corchea, 3 negra, 4 blanca, 5 redonda.
@@ -209,23 +212,42 @@ def generar(pistas, ticks_por_tiempo, onsets, pulso, datos):
                 id=cantidad, bars=list(range(compases)), autoregressive=True, attributes=de_pista,
                 bar_attributes={c: dict(de_compas) for c in range(compases)} if de_compas else {})],
             config=InferenceConfig(model_dim="auto", mask_mode="attention"))
-        resultado = motor().session(musica, pedido).run()
-        resultado.to_midi(salida)
-        generado = mido.MidiFile(salida)
 
-    # 4) De la música generada interesa solo la pista nueva. Sus tiempos vuelven de la
-    #    partitura al tiempo real con la misma tabla, leída al revés.
-    escala = ticks_por_tiempo / generado.ticks_per_beat   # la librería usa otra resolución
+        # 4) El modelo tiene azar: con el mismo pedido a veces escribe algo rico y a veces
+        #    una sola nota repetida. Si sale pobre se le pide de nuevo, hasta INTENTOS veces,
+        #    y queda la versión con más notas distintas.
+        final = max(fin for pista in pistas for _, fin, _, _ in notas_de_pista(pista))
+        mejor = []
+        for _ in range(INTENTOS):
+            motor().session(copy.deepcopy(musica), pedido).run().to_midi(salida)
+            generado = mido.MidiFile(salida)
+            notas = _a_tiempo_real(generado.tracks[cantidad], ticks_por_tiempo / generado.ticks_per_beat,
+                                   reales, partitura, final, pulso)
+            if _alturas(notas) > _alturas(mejor):
+                mejor = notas
+            if _alturas(mejor) >= ALTURAS_MINIMAS:
+                break
+
+    if not mejor:
+        raise ValueError("MIDI-GPT no generó ninguna nota")
+    return _al_registro(mejor, datos.get("registro"))
+
+
+def _alturas(notas):
+    """Cuántas notas distintas (Do, Re, Mi...) usa una pista: la medida de si salió pobre."""
+    return len({nota for _, _, nota, _ in notas})
+
+
+def _a_tiempo_real(pista, escala, reales, partitura, final, pulso):
+    """Lee la pista que escribió el modelo y pasa sus tiempos de la partitura al tiempo real,
+    con la misma tabla de mapa_de_tiempo() leída al revés. escala = cambio de resolución,
+    porque la librería guarda su MIDI con otros ticks por tiempo."""
     notas = []
-    for inicio, fin, nota, velocity in notas_de_pista(generado.tracks[cantidad]):
+    for inicio, fin, nota, velocity in notas_de_pista(pista):
         a = round(float(np.interp(inicio * escala, partitura, reales)))
         b = round(float(np.interp(fin * escala, partitura, reales)))
-        notas.append((a, max(a + 1, b), nota, velocity))
-
-    # El modelo completa el último compás aunque la grabación termine antes: lo que empieza
-    # después del final de lo grabado se descarta, y la última nota suena un pulso más como mucho.
-    final = max(fin for pista in pistas for _, fin, _, _ in notas_de_pista(pista))
-    notas = [(a, min(b, final + pulso), nota, velocity) for a, b, nota, velocity in notas if a < final]
-    if not notas:
-        raise ValueError("MIDI-GPT no generó ninguna nota")
-    return _al_registro(notas, datos.get("registro"))
+        # El modelo completa el último compás aunque la grabación termine antes: lo que empieza
+        # después del final de lo grabado se descarta, y la última nota suena un pulso más como mucho.
+        if a < final:
+            notas.append((a, max(a + 1, min(b, final + pulso)), nota, velocity))
+    return notas

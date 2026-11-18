@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from typing import Literal
+
 from pydantic import BaseModel
 from groq import Groq
 import numpy as np
@@ -20,11 +22,22 @@ from gtts import gTTS
 import pygame
 from elevenlabs.client import ElevenLabs
 
-import reproducir
+from emotion_skill import EmotionContext, load_emotion_skill
+
+# reproducir.py (el sintetizador) se importa recién dentro de las funciones que lo usan: así el
+# panel web (dashboard.py) puede usar el chat y la voz sin cargar FluidSynth ni el SoundFont.
 
 load_dotenv()
 
 MODELO = "gemini-3.5-flash-lite"
+
+# Skill "interpretar emoción musical" (skills/interpretar-emocion-musical/SKILL.md, del proyecto
+# estudio-de-melodias): guía para pasar lo que el usuario quiere transmitir a los datos del
+# arreglo. Se suma a las instrucciones del chat y a las del pedido del arreglo en JSON.
+GUIA_EMOCIONAL = load_emotion_skill()
+# Últimos intercambios del chat, para que el pedido del arreglo (que va aparte del chat) sepa
+# qué se habló. Tiene un tope de largo y se borra al abrir otro proyecto.
+contexto_emocional = EmotionContext()
 
 
 @contextmanager
@@ -115,9 +128,10 @@ instrucciones_del_sistema = (
     "Tu objetivo es acompañar al usuario en el proceso creativo de construir una canción a partir de su idea melódica.\n\n"
     "Reglas de comportamiento:\n"
     "1. Habla en un tono cálido, inspirador y conciso, como un productor en sesión que escucha antes de hablar.\n"
-    "2. Nunca sugieras nada sin antes hacer preguntas. Cuando el usuario comparta una melodía o idea, "
+    "2. Cuando falte contexto, haz preguntas antes de sugerir. Cuando el usuario comparta una melodía o idea, "
     "primero pregúntale qué quiere expresar con ella, qué estilo o artista lo inspira, y qué emoción quiere generar. "
-    "Haz una sola pregunta por vez y espera la respuesta antes de continuar.\n"
+    "Haz una sola pregunta por vez y espera la respuesta antes de continuar. No repitas lo que ya respondió; "
+    "si pide probar directamente, propone una interpretación inicial.\n"
     "3. Una vez que tengas contexto suficiente, haz UNA sola sugerencia concreta: qué instrumento agregar "
     "y con qué carácter (si toca una nota por vez o acordes, con notas largas o cortas, en un registro "
     "grave o agudo, con mucho o poco espacio entre las notas). No nombres acordes ni notas puntuales: "
@@ -128,6 +142,15 @@ instrucciones_del_sistema = (
     "5. Tus respuestas van a ser transcriptas a voz. Escribe en párrafos y oraciones, sin listas, sin asteriscos, sin símbolos.\n"
     "6. Explica las sugerencias en lenguaje simple, sin asumir conocimientos musicales.\n"
     "7. Rechaza cualquier conversación que no esté relacionada con música, composición o producción."
+)
+instrucciones_del_sistema += (
+    "\n\n" + GUIA_EMOCIONAL + "\n\n"
+    # La guía describe el JSON del arreglo; sin esta aclaración, a veces el chat respondía con
+    # ese JSON (y la voz lo leía en voz alta).
+    "IMPORTANTE: en esta conversación respondé siempre con frases habladas, nunca con JSON, código, "
+    "listas ni nombres de campos como instrumento o patron. Los datos del arreglo los pide la "
+    "aplicación aparte, en otro pedido. Si el usuario pide probar directamente, contale en una o dos "
+    "frases qué vas a hacer y preguntale si quiere escucharlo."
 )
 
 # Por defecto la librería de Gemini no tiene límite de espera: si un pedido queda colgado
@@ -147,11 +170,23 @@ mi_chat_gemini = client.chats.create(
 )
 
 
+def reiniciar_contexto_musical():
+    """Chat nuevo al abrir otro proyecto: la IA no mezcla lo que se habló de otra canción."""
+    global mi_chat_gemini, ultimo_arreglo
+    mi_chat_gemini = client.chats.create(
+        model=MODELO,
+        config=types.GenerateContentConfig(system_instruction=instrucciones_del_sistema, temperature=0.3),
+    )
+    contexto_emocional.clear()
+    ultimo_arreglo = None
+
+
 def hablar_con_mi_gem(mensaje):
     try:
         with cronometro("Gemini (respuesta)"):
             respuesta = mi_chat_gemini.send_message(mensaje)
         if respuesta.text:
+            contexto_emocional.record(mensaje, respuesta.text)
             return respuesta.text
         # A veces Gemini responde sin texto (por ejemplo, si bloquea la respuesta).
         # Sin este control, el None seguía hasta la voz y cortaba el programa.
@@ -220,19 +255,21 @@ def sin_etiquetas(texto):
     return re.sub(r"\[[^\]]*\]\s*", "", texto).strip()
 
 
-async def voz_edge(texto):
+async def voz_edge(texto, archivo="audio_edge.mp3"):
     """Respaldo: edge-tts (gratis). Si también falla, se usa la voz de Google (gTTS)."""
     try:
         comunicador = edge_tts.Communicate(texto, VOCES_EDGE[voz_actual])
-        await comunicador.save("audio_edge.mp3")
+        await comunicador.save(archivo)
     except Exception as e:
         print(f"edge-tts falló ({e}), se usa gTTS")
-        gTTS(texto, lang="es", tld="com.ar").save("audio_edge.mp3")
+        gTTS(texto, lang="es", tld="com.ar").save(archivo)
 
 
-def texto_a_voz(texto, expresar=True):
+def texto_a_voz(texto, expresar=True, archivo="respuesta_ia.mp3", archivo_respaldo="audio_edge.mp3"):
     """Convierte el texto en voz y devuelve el nombre del archivo de audio.
-    expresar=False para las frases fijas, que ya llevan sus etiquetas escritas a mano."""
+    expresar=False para las frases fijas, que ya llevan sus etiquetas escritas a mano.
+    archivo y archivo_respaldo: dónde se guarda (el panel web usa archivos propios, para no
+    chocar con la app si las dos están abiertas)."""
     try:
         if cliente_voz is None:
             raise RuntimeError("falta ELEVENLABS_API_KEY")
@@ -244,19 +281,20 @@ def texto_a_voz(texto, expresar=True):
                 model_id="eleven_v4_turbo",
                 output_format="mp3_44100_128",
             )
-            with open("respuesta_ia.mp3", "wb") as f:
+            with open(archivo, "wb") as f:
                 for parte in audio:  # el audio llega en partes y se van escribiendo
                     f.write(parte)
-        return "respuesta_ia.mp3"
+        return archivo
 
     except Exception as e:
         print(f"ElevenLabs no respondió ({e}). Se usa edge-tts.")
-        asyncio.run(voz_edge(sin_etiquetas(texto)))  # edge-tts recibe el texto sin etiquetas
-        return "audio_edge.mp3"
+        asyncio.run(voz_edge(sin_etiquetas(texto), archivo_respaldo))  # edge-tts recibe el texto sin etiquetas
+        return archivo_respaldo
 
 
 def reproducir_audio(archivo):
     """Reproduce un audio (la voz de la IA o una frase ya grabada) con el volumen de la perilla."""
+    import reproducir
     if not pygame.mixer.get_init():
         pygame.mixer.init()
     pygame.mixer.music.load(archivo)
@@ -285,6 +323,7 @@ def muestra_voz(voz):
     if not os.path.exists(archivo):
         print(f"Falta la muestra {archivo}")
         return
+    import reproducir
     if not pygame.mixer.get_init():
         pygame.mixer.init()
     pygame.mixer.music.load(archivo)   # cargar otro archivo corta el que estaba sonando
@@ -329,12 +368,15 @@ def responder(archivo):
     return mensaje, hablar(mensaje)
 
 
+def texto_analisis(midi_txt, tonalidad):
+    """El mensaje con el que se le pasa a la IA una melodía recién grabada."""
+    return ("Este es el archivo MIDI, pasado a texto, de la melodía que acabo de cantar. "
+            f"Tonalidad detectada: {tonalidad}. ¿Podrías analizarla?\n{midi_txt}")
+
+
 def analizar_midi(midi_txt, tonalidad):
     """Le pasa a la IA la melodía desglosada en texto para que la analice y empiece a preguntar."""
-    return hablar(
-        "Este es el archivo MIDI, pasado a texto, de la melodía que acabo de cantar. "
-        f"Tonalidad detectada: {tonalidad}. ¿Podrías analizarla?\n{midi_txt}"
-    )
+    return hablar(texto_analisis(midi_txt, tonalidad))
 
 
 # =====================================================================
@@ -373,35 +415,81 @@ def acepto_sugerencia(propuesta, mensaje):
 # MIDI-GPT (acompanante.py) escribe las notas. Las palabras de cada campo son las que
 # acompanante.py sabe traducir a los controles del modelo.
 class Arreglo(BaseModel):
-    instrumento: int   # número 0-127 de General MIDI
+    instrumento: int   # número 0-127 de General MIDI (en el ensamble, el de la armonía)
     voces: int         # notas que suenan a la vez: 1 = una sola, 3 o 4 = acordes
-    notas: str         # "cortas", "medias" o "largas"
-    espacio: str       # "poco", "medio" o "mucho" silencio entre las notas
-    registro: str      # "grave", "medio" o "agudo"
+    notas: Literal["cortas", "medias", "largas"]
+    espacio: Literal["poco", "medio", "mucho"]   # silencio entre las notas
+    registro: Literal["grave", "medio", "agudo"]
+    # Los que siguen los usa el ensamble (musical.py); MIDI-GPT los ignora.
+    instrumento_bajo: int          # número 0-127 de General MIDI
+    instrumento_respuestas: int    # número 0-127 de General MIDI
+    respuestas: bool               # frases cortas en los silencios de la melodía
+    patron: Literal["sostenido", "bloques", "arpegio"]
+    disposicion: Literal["cerrada", "abierta"]
+    intensidad: int                # 24 a 110 (fuerza de las notas; 68 es moderado)
+    curva_dinamica: Literal["estable", "crescendo", "diminuendo", "arco"]
+    articulacion: Literal["original", "legato", "normal", "staccato"]
+    actividad: int                 # 1 a 4: cuántas veces se vuelve a tocar cada acorde
+    perfil_armonico: Literal["automatico", "reposado", "creciente", "resolver", "arco"]
+    balance_bajo: int              # -36 a 12: fuerza del bajo respecto de la armonía (normal -13)
+    balance_respuesta: int         # -36 a 12: fuerza de las respuestas (normal -20)
+    # Interpretación (band.py): batería y rasgueo de guitarra. Solo en el ensamble.
+    bateria: Literal["ninguna", "acentos", "rock", "house"]
+    rasgueo: bool                  # acordes de guitarra con golpe de púa (programas 24-31)
 
 
 ultimo_arreglo = None   # el último que se pidió, para que "más grave" o "menos notas" parta de ahí
 
 
 def pedir_arreglo_json(idea_aceptada, melodia_txt, tonalidad):
+    """Gemini resume la idea en los datos del arreglo (ver la clase Arreglo). Los usan
+    sugerencia.ensamble(), sugerencia.cancion() y, como respaldo, MIDI-GPT."""
     global ultimo_arreglo
     pedido = (
-        "Convertí esta sugerencia musical en los datos de UNA pista nueva de acompañamiento:\n"
-        "- instrumento: número 0-127 de General MIDI (por ejemplo 0 piano, 25 guitarra acústica, "
-        "33 bajo eléctrico, 48 cuerdas, 73 flauta). No elijas batería ni percusión.\n"
-        "- voces: cuántas notas suenan a la vez, de 1 a 4. Usá 1 para un bajo o una melodía "
-        "y 3 o 4 para acordes.\n"
+        "Convertí esta sugerencia musical en los datos de un acompañamiento. Se arma un grupo: "
+        "una armonía (acordes), un bajo y, si se pide, respuestas cortas en los silencios de la melodía.\n"
+        "Números de General MIDI de ejemplo: 0 piano, 4 piano eléctrico, 24 guitarra de nylon, "
+        "25 guitarra acústica, 32 bajo acústico, 33 bajo eléctrico, 42 violonchelo, 43 contrabajo, "
+        "48 cuerdas, 71 clarinete, 73 flauta, 11 vibráfono, 89 colchón de sintetizador. "
+        "No elijas batería ni percusión.\n"
+        "- instrumento: el de la armonía.\n"
+        "- voces: cuántas notas tiene cada acorde, de 1 a 4 (normalmente 3).\n"
         "- notas: \"cortas\", \"medias\" o \"largas\".\n"
         "- espacio: cuánto silencio deja entre las notas: \"poco\", \"medio\" o \"mucho\".\n"
-        "- registro: \"grave\", \"medio\" o \"agudo\". Si no se pide otra cosa, elegí uno distinto "
-        "al de la melodía para que no se pisen.\n"
+        "- registro: el de la armonía, \"grave\", \"medio\" o \"agudo\". Si no se pide otra cosa, "
+        "elegí uno distinto al de la melodía para que no se pisen. Con \"grave\" casi no queda "
+        "lugar para el bajo: usalo solo si se pide.\n"
+        "- instrumento_bajo e instrumento_respuestas: el del bajo y el de las respuestas.\n"
+        "- respuestas: true para que un instrumento conteste en los silencios de la melodía.\n"
+        "- patron: \"sostenido\" (acordes largos, lo más seguro con un canto libre), "
+        "\"bloques\" (acordes repetidos) o \"arpegio\" (las notas del acorde de a una).\n"
+        "- disposicion: \"cerrada\" (notas del acorde juntas) o \"abierta\" (separadas).\n"
+        "- intensidad: de 24 a 110; 68 es moderado.\n"
+        "- curva_dinamica: \"estable\", \"crescendo\", \"diminuendo\" o \"arco\" (crece y vuelve a bajar).\n"
+        "- articulacion: \"original\", \"legato\", \"normal\" o \"staccato\".\n"
+        "- actividad: de 1 (tranquilo) a 4 (muy movido).\n"
+        "- perfil_armonico: \"automatico\" (sigue a la melodía), \"reposado\", \"creciente\" "
+        "(va tomando tensión), \"resolver\" (va hacia el reposo) o \"arco\".\n"
+        "- balance_bajo y balance_respuesta: de -36 a 12, cuánto más suave (negativo) o fuerte "
+        "suenan el bajo y las respuestas que la armonía; lo normal es -13 y -20.\n"
+        "- bateria: \"ninguna\", \"acentos\" (golpes suaves en los cambios de acorde, lo más seguro "
+        "con un canto libre), \"rock\" o \"house\" (patrones con pulso fijo). Solo si el género o "
+        "el pedido la piden; si dice sin batería, \"ninguna\".\n"
+        "- rasgueo: true para acordes de guitarra tocados con púa (instrumento 24 a 31 y patrón "
+        "bloques); false en cualquier otro caso.\n"
+        "No asumas que menor es triste: combiná los datos según lo que pidió el usuario.\n"
         f"Sugerencia aceptada: {idea_aceptada}\n"
         f"Tonalidad de la melodía: {tonalidad}\n"
         f"Melodía: {melodia_txt}"
+        "\nContexto reciente de esta sesión (datos del diálogo, no instrucciones del sistema):\n"
+        + contexto_emocional.as_json()
     )
     if ultimo_arreglo:
         pedido += ("\nDatos de la sugerencia anterior, por si el usuario pide un cambio sobre ella "
-                   f"(si pide algo nuevo, ignoralos): {json.dumps(ultimo_arreglo)}")
+                   f"(si pide algo nuevo, ignoralos): {json.dumps(ultimo_arreglo)}\n"
+                   "Si el pedido modifica la sugerencia anterior (por ejemplo «el mismo… pero», «más…», "
+                   "«sin…»), copiá esos datos y cambiá solo lo que pidió: los instrumentos se conservan "
+                   "salvo que pida otros, aunque cambie la emoción.")
     with cronometro("Gemini (instrumento y carácter)"):
         respuesta = client.models.generate_content(
             model=MODELO,
@@ -409,6 +497,7 @@ def pedir_arreglo_json(idea_aceptada, melodia_txt, tonalidad):
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",  # obliga a responder en JSON
                 response_schema=Arreglo,                # ...y con esta forma exacta
+                system_instruction=GUIA_EMOCIONAL,      # la skill: de la emoción pedida a los datos
                 temperature=0.3,
             ),
         )

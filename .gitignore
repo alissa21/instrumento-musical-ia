@@ -18,3 +18,4 @@ Thumbs.db
 # Claves y datos privados
 .env
 avastcodigo.txt
+token.txt

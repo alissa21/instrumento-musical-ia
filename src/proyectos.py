@@ -6,7 +6,7 @@ from datetime import datetime
 import mido
 
 import esp32
-import gem
+from asistente import gem   # Gemini o ChatGPT, según IA_CHAT en el .env
 import grabar
 
 # Cada proyecto es un archivo MIDI tipo 1: un solo .mid con varias pistas adentro.

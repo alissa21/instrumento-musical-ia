@@ -5,7 +5,7 @@ import time
 
 import serial
 
-import gem
+from asistente import gem   # Gemini o ChatGPT, según IA_CHAT en el .env
 import proyectos
 import reproducir
 
@@ -44,6 +44,10 @@ _SI_NO = {
 }
 _CONFIRMACION = {
     "NOMBRE:OK": True,  "NOMBRE:REPETIR": False,   # "¿Es correcto?"
+}
+_TIPO_SUGERENCIA = {
+    "SUG:ENSAMBLE": "ensamble",   # "¿Qué querés que genere?" Instrumentos
+    "SUG:CANCION": "cancion",     # ... Canción larga
 }
 
 
@@ -159,6 +163,8 @@ def _repartir(linea):
         _pedidos.put(("SI_NO", _SI_NO[linea]))
     elif linea in _CONFIRMACION:
         _pedidos.put(("CONFIRMACION", _CONFIRMACION[linea]))
+    elif linea in _TIPO_SUGERENCIA:
+        _pedidos.put(("TIPO_SUGERENCIA", _TIPO_SUGERENCIA[linea]))
 
     # ----- Pistas: MOVER:canal:tiempos / PISTA:canal:accion[:valor] -----
     elif partes[0] == "MOVER" and len(partes) == 3 and partes[1].isdigit() and _es_numero(partes[2]):
@@ -219,6 +225,13 @@ def esperar_si_no():
 def esperar_confirmacion():
     """"¿Es correcto?": True = Sí, False = No (repetir)."""
     return esperar("CONFIRMACION")[1]
+
+
+def esperar_tipo_sugerencia(timeout=None):
+    """"¿Qué querés que genere?": "ensamble" (instrumentos) o "cancion" (composición larga).
+    Devuelve None si se cumple el timeout (por ejemplo, con un firmware que no tiene esa pantalla)."""
+    pedido = esperar("TIPO_SUGERENCIA", timeout)
+    return None if pedido is None else pedido[1]
 
 
 def esperar_voz():

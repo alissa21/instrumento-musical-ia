@@ -148,7 +148,8 @@ enum Pantalla {
   INICIO, LISTA_PROYECTOS, OPCIONES_PROYECTO,    // pantalla de inicio
   PREGUNTA_NOMBRE,                               // "Deseas ponerle un nombre al proyecto?"
   PRINCIPAL, MENU_INSTRUMENTOS, LISTA_INSTRUMENTOS, PISTAS, OPCIONES_PISTA,   // dentro del proyecto
-  EFECTOS_PISTA, MOVER_PISTA, AJUSTES, EFECTOS, SUGERENCIA
+  EFECTOS_PISTA, MOVER_PISTA, AJUSTES, EFECTOS, SUGERENCIA,
+  TIPO_SUGERENCIA                                // "Que queres generar?" Instrumentos / Cancion larga
 };
 enum Foco { FOCO_LISTA, FOCO_VOLVER };                                          // en las listas
 enum FocoPrincipal { F_AJUSTES, F_INSTRUMENTOS, F_PISTAS, F_REPRODUCIR, F_EFECTOS };   // en la pantalla principal
@@ -609,11 +610,16 @@ void abrirInicio() {
 }
 
 void dibujarBotonesSiNo() {
+  if (pantalla == TIPO_SUGERENCIA) {   // dos opciones con texto más largo: botones más anchos
+    dibujarBoton(20, 220, 210, 64, "Instrumentos", opcionSiNo == 0, fuenteQueEntra("Instrumentos", 200));
+    dibujarBoton(250, 220, 210, 64, "Cancion larga", opcionSiNo == 1, fuenteQueEntra("Cancion larga", 200));
+    return;
+  }
   dibujarBoton(90, 220, 130, 64, "Si", opcionSiNo == 0, 4);
   dibujarBoton(260, 220, 130, 64, "No", opcionSiNo == 1, 4);
 }
 
-// La misma pantalla de dos opciones sirve para las tres preguntas.
+// La misma pantalla de dos opciones sirve para las cuatro preguntas.
 void abrirSiNo(Pantalla p) {
   pantalla = p;
   opcionSiNo = 0;
@@ -624,6 +630,9 @@ void abrirSiNo(Pantalla p) {
   } else if (p == CONFIRMAR_NOMBRE) {
     textoCentrado("Es correcto?", 70, TFT_CYAN, 4);
     textoCentrado(nombreTranscripto, 135, TFT_GREEN, fuenteQueEntra(nombreTranscripto, 460));
+  } else if (p == TIPO_SUGERENCIA) {
+    textoCentrado("Que queres que genere?", 80, TFT_CYAN, 4);
+    textoCentrado("Acompanar la melodia o seguirla en una cancion", 130, TFT_WHITE, 2);
   } else {   // SUGERENCIA
     textoCentrado("Aceptar sugerencia?", 80, TFT_CYAN, 4);
     textoCentrado("Escucha la sugerencia de la IA", 130, TFT_WHITE, 2);
@@ -1008,13 +1017,17 @@ void responderSiNo(bool si) {
       Serial.println(si ? "SUG:OK" : "SUG:NO");
       abrirPrincipal(false);
       break;
+    case TIPO_SUGERENCIA:     // "Que queres que genere?" (si = la opción de la izquierda)
+      Serial.println(si ? "SUG:ENSAMBLE" : "SUG:CANCION");
+      mostrarMensaje("La IA esta pensando...");   // Python manda PANTALLA:SUGERENCIA cuando la tiene
+      break;
     default:
       break;
   }
 }
 
 bool esSiNo(Pantalla p) {
-  return p == PREGUNTA_NOMBRE || p == CONFIRMAR_NOMBRE || p == SUGERENCIA;
+  return p == PREGUNTA_NOMBRE || p == CONFIRMAR_NOMBRE || p == SUGERENCIA || p == TIPO_SUGERENCIA;
 }
 
 // Movimiento del joystick: cada pantalla lo usa a su manera.
@@ -1156,6 +1169,8 @@ void procesarLinea(String linea) {
       abrirPrincipal(proyectoNuevo);
     } else if (cual == "SUGERENCIA") {
       abrirSiNo(SUGERENCIA);
+    } else if (cual == "TIPO_SUGERENCIA") {
+      abrirSiNo(TIPO_SUGERENCIA);
     }
   } else if (linea.startsWith("LISTA:")) {
     separarProyectos(linea.substring(6));
@@ -1242,20 +1257,22 @@ void setup() {
   }
 
   // Teclado
-  pinMode(pinPL, OUTPUT);
-  pinMode(pinCLK, OUTPUT);
-  // Con pull-up: si el teclado no está conectado, el pin lee siempre 1 (= ninguna tecla
-  // apretada) en vez de quedar al aire y mandar notas falsas. Con los 74HC165 conectados
-  // no cambia nada, porque el chip maneja el pin.
-  pinMode(pinData, INPUT_PULLUP);
-  digitalWrite(pinPL, HIGH);
-  digitalWrite(pinCLK, LOW);
-  // Parte del estado real para no mandar notas falsas al arrancar:
-  // una tecla ya apretada queda como APRETADA sin mandar ON.
-  uint32_t inicial = leerTeclas();
-  for (int i = 0; i < NUM_TECLAS; i++) {
-    if (inicial & (1UL << (2 * i))) teclas[i].estado = APRETADA;
-  }
+  // TECLAS DESACTIVADAS: las placas de las teclas no están conectadas. Para volver a
+  // usarlas, descomentar este bloque y la línea actualizarTeclado() de loop().
+  // pinMode(pinPL, OUTPUT);
+  // pinMode(pinCLK, OUTPUT);
+  // // Con pull-up: si el teclado no está conectado, el pin lee siempre 1 (= ninguna tecla
+  // // apretada) en vez de quedar al aire y mandar notas falsas. Con los 74HC165 conectados
+  // // no cambia nada, porque el chip maneja el pin.
+  // pinMode(pinData, INPUT_PULLUP);
+  // digitalWrite(pinPL, HIGH);
+  // digitalWrite(pinCLK, LOW);
+  // // Parte del estado real para no mandar notas falsas al arrancar:
+  // // una tecla ya apretada queda como APRETADA sin mandar ON.
+  // uint32_t inicial = leerTeclas();
+  // for (int i = 0; i < NUM_TECLAS; i++) {
+  //   if (inicial & (1UL << (2 * i))) teclas[i].estado = APRETADA;
+  // }
 
   // Joystick. No tocarlo durante el arranque: acá mide su centro.
   pinMode(SW_PIN, INPUT_PULLUP);
@@ -1275,7 +1292,7 @@ void setup() {
 }
 
 void loop() {
-  actualizarTeclado();
+  // actualizarTeclado();   // TECLAS DESACTIVADAS (ver setup)
   actualizarJoystick();
   actualizarBotones();
   if (HAY_POTENCIOMETRO) leerPotenciometro();
